@@ -1,12 +1,62 @@
-use async_std::{io, net, prelude::*, sync::Arc, task};
+use async_std::{
+    io, net,
+    prelude::*,
+    sync::{Arc, RwLock},
+    task,
+};
+use lazy_static::lazy_static;
 use rand::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod packet;
 
 const MAX_TEST: u64 = 10000;
 static player_num: AtomicUsize = AtomicUsize::new(0);
+lazy_static! {
+    static ref player_map: RwLock<HashMap<u32, Player>> = RwLock::new(HashMap::new());
+}
+
+struct Player {
+    id: u32,
+    position: AtomicU64,
+}
+
+impl Player {
+    fn get_pos(&self) -> (u32, u32) {
+        let pos = self.position.load(Ordering::Relaxed);
+        let mask = 0xffffffff;
+        let x = (pos >> 32) as u32;
+        let y = (pos & mask) as u32;
+        (x, y)
+    }
+    fn set_pos(&self, x: u32, y: u32) {
+        let new_pos: u64 = ((x as u64) << 32) | y as u64;
+        self.position.store(new_pos, Ordering::SeqCst);
+    }
+}
+
+fn from_bytes<T>(bytes: &[u8]) -> &T {
+    unsafe { &*(bytes.as_ptr() as *const T) }
+}
+
+async fn process_packet(packet: &[u8]) {
+    use packet::*;
+    match SCPacketType::from(packet[1] as usize) {
+        SCPacketType::SC_LOGIN_OK => {
+            let p = from_bytes::<SCLoginOk>(packet);
+            let mut rg = player_map.write().await;
+            rg.insert(p.id, Player{id: p.id, position: AtomicU64::new(0)});
+        }
+        SCPacketType::SC_POS => {
+            let p = from_bytes::<SCPosPlayer>(packet);
+            let rg = player_map.read().await;
+            rg.get(&p.id).expect("Can't find a player by id").set_pos(p.x as u32, p.y as u32);
+        }
+        _ => {}
+    }
+}
 
 async fn receiver(stream: Arc<net::TcpStream>) {
     let mut stream = io::BufReader::new(&*stream);

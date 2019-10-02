@@ -8,7 +8,7 @@ pub struct PacketHeader {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub enum SCPacketType{
+pub enum SCPacketType {
     SC_LOGIN_OK = 1,
     SC_PUT,
     SC_REMOVE,
@@ -22,13 +22,13 @@ impl From<usize> for SCPacketType {
             2 => &(value as u16) as *const u16 as *const Self,
             4 => &(value as u32) as *const u32 as *const Self,
             8 => &(value as u64) as *const u64 as *const Self,
-            _ => unreachable!()
+            _ => unreachable!(),
         };
-        unsafe{ *p }
+        unsafe { *p }
     }
 }
 
-enum CSPacketType{
+enum CSPacketType {
     CS_UP = 1,
     CS_DOWN,
     CS_LEFT,
@@ -59,15 +59,27 @@ pub struct CSMove(pub PacketHeader);
 
 impl CSMove {
     pub fn left() -> Self {
-        Self(PacketHeader{size: size_of::<Self>() as u8, p_type: CSPacketType::CS_LEFT as u8})
+        Self(PacketHeader {
+            size: size_of::<Self>() as u8,
+            p_type: CSPacketType::CS_LEFT as u8,
+        })
     }
     pub fn right() -> Self {
-        Self(PacketHeader{size: size_of::<Self>() as u8, p_type: CSPacketType::CS_RIGHT as u8})
+        Self(PacketHeader {
+            size: size_of::<Self>() as u8,
+            p_type: CSPacketType::CS_RIGHT as u8,
+        })
     }
     pub fn up() -> Self {
-        Self(PacketHeader{size: size_of::<Self>() as u8, p_type: CSPacketType::CS_UP as u8})
+        Self(PacketHeader {
+            size: size_of::<Self>() as u8,
+            p_type: CSPacketType::CS_UP as u8,
+        })
     }
     pub fn down() -> Self {
-        Self(PacketHeader{size: size_of::<Self>() as u8, p_type: CSPacketType::CS_DOWN as u8})
+        Self(PacketHeader {
+            size: size_of::<Self>() as u8,
+            p_type: CSPacketType::CS_DOWN as u8,
+        })
     }
 }
