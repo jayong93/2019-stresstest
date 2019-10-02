@@ -189,9 +189,9 @@ fn main() -> GameResult {
     };
 
     task::spawn(server);
-    let setup = WindowSetup::default().title("Chess Client");
+    let setup = WindowSetup::default().title("Stress Test");
     let win_mode = WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32);
-    let cb = ContextBuilder::new("PL-Client", "CJY")
+    let cb = ContextBuilder::new("PL-StressTest", "CJY")
         .window_setup(setup)
         .window_mode(win_mode);
     let (mut ctx, mut event_loop) = cb.build()?;
