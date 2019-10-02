@@ -78,6 +78,7 @@ async fn process_packet(packet: &[u8], my_id: Option<u32>) -> Option<u32> {
         SCPacketType::SC_POS => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
+
             if let Some(mid) = my_id {
                 if mid == id {
                     let rg = PLAYER_MAP.read().await;
@@ -139,29 +140,40 @@ async fn sender(stream: Arc<net::TcpStream>) {
 struct GameState {}
 
 impl EventHandler for GameState {
-    fn update(&mut self, _ctx: &mut Context) -> GameResult {
+    fn update(&mut self, ctx: &mut Context) -> GameResult {
+        let delta = ggez::timer::delta(ctx).as_secs_f32();
+        let target = 1.0/30.0;
+        if delta <= 1.0/30.0 {
+            ggez::timer::sleep(std::time::Duration::from_secs_f32(target - delta));
+        }
         Ok(())
     }
 
     fn draw(&mut self, ctx: &mut Context) -> GameResult {
         graphics::clear(ctx, [0.0, 0.0, 0.0, 1.0].into());
         let mut mesh_builder = graphics::MeshBuilder::new();
-        let p_map = task::block_on(PLAYER_MAP.read());
-
         let d_mode = graphics::DrawMode::fill();
-        for player in p_map.values() {
-            let (x, y) = player.get_pos();
-            let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-            let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-            mesh_builder.rectangle(
-                d_mode,
-                [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
-                [1.0, 1.0, 1.0, 1.0].into(),
-            );
+        let can_render;
+        {
+            let p_map = task::block_on(PLAYER_MAP.read());
+            can_render = !p_map.is_empty();
+
+            for player in p_map.values() {
+                let (x, y) = player.get_pos();
+                let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                mesh_builder.rectangle(
+                    d_mode,
+                    [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
+                    [1.0, 1.0, 1.0, 1.0].into(),
+                );
+            }
         }
-        mesh_builder
-            .build(ctx)?
-            .draw(ctx, graphics::DrawParam::new())?;
+        if can_render {
+            mesh_builder
+                .build(ctx)?
+                .draw(ctx, graphics::DrawParam::new())?;
+        }
         graphics::present(ctx)
     }
 }
@@ -174,6 +186,7 @@ fn main() -> GameResult {
                     let client = net::TcpStream::connect("127.0.0.1:3500")
                         .await
                         .expect("Can't connect to server");
+                    client.set_nodelay(true).expect("Can't set nodelay option");
                     let client = Arc::new(client);
                     let recv = task::spawn(receiver(client.clone()));
                     let send = task::spawn(sender(client));
@@ -188,7 +201,6 @@ fn main() -> GameResult {
         handle.await;
     };
 
-    task::spawn(server);
     let setup = WindowSetup::default().title("Stress Test");
     let win_mode = WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32);
     let cb = ContextBuilder::new("PL-StressTest", "CJY")
@@ -196,5 +208,7 @@ fn main() -> GameResult {
         .window_mode(win_mode);
     let (mut ctx, mut event_loop) = cb.build()?;
     let mut game_state = GameState {};
+
+    task::spawn(server);
     event::run(&mut ctx, &mut event_loop, &mut game_state)
 }
