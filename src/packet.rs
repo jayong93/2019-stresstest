@@ -46,8 +46,8 @@ pub struct SCPutPlayer {
 pub struct SCPosPlayer {
     pub header: PacketHeader,
     pub id: u32,
-    pub x: u8,
-    pub y: u8,
+    pub x: u16,
+    pub y: u16,
 }
 #[repr(C, packed(1))]
 pub struct SCLoginOk {

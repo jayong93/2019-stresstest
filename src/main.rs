@@ -14,17 +14,19 @@ use rand::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use structopt::StructOpt;
 
 mod packet;
 
-const MAX_TEST: u64 = 10000;
-const WINDOW_SIZE: (usize, usize) = (800, 800);
-const BOARD_SIZE: usize = 127;
-const CELL_SIZE: f32 = (WINDOW_SIZE.0 as f32) / (BOARD_SIZE as f32);
+static mut MAX_TEST: u64 = 0;
+static mut WINDOW_SIZE: (usize, usize) = (0, 0);
+static mut BOARD_SIZE: usize = 0;
+static mut CELL_SIZE: f32 = 0.0;
+static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 lazy_static! {
     static ref PLAYER_MAP: RwLock<HashMap<u32, Player>> =
-        RwLock::new(HashMap::with_capacity(MAX_TEST as usize));
+        RwLock::new(HashMap::with_capacity(unsafe { MAX_TEST } as usize));
 }
 
 struct Player {
@@ -102,15 +104,11 @@ async fn receiver(stream: Arc<net::TcpStream>) {
     let mut read_buf = vec![0; 256];
     let mut my_id = None;
     loop {
-        stream
-            .read_exact(&mut read_buf[..1])
-            .await
-            .expect("Can't read from server");
+        stream.read_exact(&mut read_buf[..1]).await;
+        // .expect("Can't read from server");
         let total_size = read_buf[0] as usize;
-        stream
-            .read_exact(&mut read_buf[1..total_size])
-            .await
-            .expect("Can't read from server");
+        stream.read_exact(&mut read_buf[1..total_size]).await;
+        // .expect("Can't read from server");
         my_id = process_packet(&read_buf[..total_size], my_id).await;
     }
 }
@@ -132,7 +130,8 @@ async fn sender(stream: Arc<net::TcpStream>) {
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        stream.write_all(bytes).await.expect("Can't send to server");
+        // stream.write_all(bytes).await.expect("Can't send to server");
+        stream.write_all(bytes).await;
         task::sleep(Duration::from_millis(1000)).await;
     }
 }
@@ -142,8 +141,8 @@ struct GameState {}
 impl EventHandler for GameState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
         let delta = ggez::timer::delta(ctx).as_secs_f32();
-        let target = 1.0/30.0;
-        if delta <= 1.0/30.0 {
+        let target = 1.0 / 30.0;
+        if delta <= 1.0 / 30.0 {
             ggez::timer::sleep(std::time::Duration::from_secs_f32(target - delta));
         }
         Ok(())
@@ -160,13 +159,15 @@ impl EventHandler for GameState {
 
             for player in p_map.values() {
                 let (x, y) = player.get_pos();
-                let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                mesh_builder.rectangle(
-                    d_mode,
-                    [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
-                    [1.0, 1.0, 1.0, 1.0].into(),
-                );
+                unsafe {
+                    let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                    let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                    mesh_builder.rectangle(
+                        d_mode,
+                        [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
+                        [1.0, 1.0, 1.0, 1.0].into(),
+                    );
+                }
             }
         }
         if can_render {
@@ -178,12 +179,43 @@ impl EventHandler for GameState {
     }
 }
 
+#[derive(Debug, StructOpt)]
+struct CmdOption {
+    #[structopt(short, long, default_value = "300")]
+    board_size: u16,
+
+    #[structopt(short, long, default_value = "1000")]
+    max_player: usize,
+
+    #[structopt(short, long, default_value = "800")]
+    window_size: Vec<usize>,
+
+    #[structopt(short, long, default_value = "3500")]
+    port: u16,
+}
+
 fn main() -> GameResult {
+    let opt = CmdOption::from_args();
+    unsafe {
+        MAX_TEST = opt.max_player as u64;
+        match opt.window_size.len() {
+            1 => {
+                let size = opt.window_size.first().unwrap();
+                WINDOW_SIZE = (*size, *size);
+            }
+            _ => {
+                WINDOW_SIZE = (opt.window_size[0], opt.window_size[1]);
+            }
+        }
+        BOARD_SIZE = opt.board_size as usize;
+        PORT = opt.port;
+        CELL_SIZE = (WINDOW_SIZE.0 as f32) / (BOARD_SIZE as f32);
+    }
     let server = async {
-        let handle = (0..MAX_TEST)
+        let handle = (0..unsafe { MAX_TEST })
             .map(|_| {
                 task::spawn(async {
-                    let client = net::TcpStream::connect("127.0.0.1:3500")
+                    let client = net::TcpStream::connect(("127.0.0.1", unsafe{PORT}))
                         .await
                         .expect("Can't connect to server");
                     client.set_nodelay(true).expect("Can't set nodelay option");
@@ -202,7 +234,8 @@ fn main() -> GameResult {
     };
 
     let setup = WindowSetup::default().title("Stress Test");
-    let win_mode = WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32);
+    let win_mode =
+        unsafe { WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32) };
     let cb = ContextBuilder::new("PL-StressTest", "CJY")
         .window_setup(setup)
         .window_mode(win_mode);
