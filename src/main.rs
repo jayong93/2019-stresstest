@@ -104,11 +104,18 @@ async fn receiver(stream: Arc<net::TcpStream>) {
     let mut read_buf = vec![0; 256];
     let mut my_id = None;
     loop {
-        stream.read_exact(&mut read_buf[..1]).await;
-        // .expect("Can't read from server");
+        let read_result = stream.read_exact(&mut read_buf[..1]).await;
+        if read_result.is_err() {
+            return;
+        }
         let total_size = read_buf[0] as usize;
-        stream.read_exact(&mut read_buf[1..total_size]).await;
-        // .expect("Can't read from server");
+        if stream
+            .read_exact(&mut read_buf[1..total_size])
+            .await
+            .is_err()
+        {
+            return;
+        }
         my_id = process_packet(&read_buf[..total_size], my_id).await;
     }
 }
@@ -131,7 +138,9 @@ async fn sender(stream: Arc<net::TcpStream>) {
             )
         };
         // stream.write_all(bytes).await.expect("Can't send to server");
-        stream.write_all(bytes).await;
+        if stream.write_all(bytes).await.is_err() {
+            return;
+        }
         task::sleep(Duration::from_millis(1000)).await;
     }
 }
@@ -212,25 +221,30 @@ fn main() -> GameResult {
         CELL_SIZE = (WINDOW_SIZE.0 as f32) / (BOARD_SIZE as f32);
     }
     let server = async {
-        let handle = (0..unsafe { MAX_TEST })
-            .map(|_| {
-                task::spawn(async {
-                    let client = net::TcpStream::connect(("127.0.0.1", unsafe{PORT}))
-                        .await
-                        .expect("Can't connect to server");
-                    client.set_nodelay(true).expect("Can't set nodelay option");
-                    let client = Arc::new(client);
-                    let recv = task::spawn(receiver(client.clone()));
-                    let send = task::spawn(sender(client));
-                    let num = PLAYER_NUM.fetch_add(1, Ordering::SeqCst) + 1;
-                    println!("Current Player Num: {}", num);
-                    recv.await;
-                    send.await;
+        let mut handle = None;
+        while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
+            handle = (0..)
+                .map(|_| {
+                    task::spawn(async {
+                        if let Ok(client) =
+                            net::TcpStream::connect(("127.0.0.1", unsafe { PORT })).await
+                        {
+                            client.set_nodelay(true).ok();
+                            let client = Arc::new(client);
+                            let recv = task::spawn(receiver(client.clone()));
+                            let send = task::spawn(sender(client));
+                            let num = PLAYER_NUM.fetch_add(1, Ordering::Relaxed) + 1;
+                            println!("Current Player Num: {}", num);
+                            recv.await;
+                            send.await;
+                        }
+                    })
                 })
-            })
-            .last()
-            .unwrap();
-        handle.await;
+                .take(100)
+                .last();
+            task::sleep(Duration::from_millis(200)).await;
+        }
+        handle.unwrap().await;
     };
 
     let setup = WindowSetup::default().title("Stress Test");
