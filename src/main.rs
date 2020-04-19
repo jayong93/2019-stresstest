@@ -2,25 +2,24 @@ use async_std::{
     io::{prelude::*, BufReader},
     net,
 };
+use evmap::{self, Options, ReadHandle, WriteHandle};
 use ggez::conf::{WindowMode, WindowSetup};
 use ggez::event::{self, EventHandler};
 use ggez::graphics;
 use ggez::graphics::Drawable;
 use ggez::{Context, ContextBuilder, GameResult};
-use lazy_static::lazy_static;
 use rand::prelude::*;
-use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tokio::{
-    sync::{oneshot, watch, RwLock},
-    task, time,
-};
+use tokio::{task, time};
 
 mod packet;
+
+type PlayerMapRead = ReadHandle<i32, Arc<Player>, (), RandomState>;
 
 static mut MAX_TEST: u64 = 0;
 static mut WINDOW_SIZE: (usize, usize) = (0, 0);
@@ -30,25 +29,44 @@ static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
 const DELAY_THRESHOLD: usize = 1000;
-lazy_static! {
-    static ref PLAYER_MAP: RwLock<HashMap<i32, Player>> =
-        RwLock::new(HashMap::with_capacity(unsafe { MAX_TEST } as usize));
-}
 
 struct Player {
     _id: i32,
     position: AtomicU32,
     seq_no: AtomicI32,
-    move_time_chan: (watch::Sender<Instant>, watch::Receiver<Instant>),
+    last_move_ptr: AtomicPtr<Instant>,
+    last_move_time: Box<Instant>,
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        unsafe { Box::from_raw(self.last_move_ptr.load(Ordering::Relaxed)) };
+    }
+}
+
+impl PartialEq for Player {
+    fn eq(&self, other: &Self) -> bool {
+        self._id == other._id
+    }
+}
+
+impl Eq for Player {}
+
+impl std::hash::Hash for Player {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self._id.hash(state);
+    }
 }
 
 impl Player {
     fn new(id: i32, x: i16, y: i16) -> Self {
+        let now = Instant::now();
         Player {
             _id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
             seq_no: AtomicI32::new(0),
-            move_time_chan: watch::channel(Instant::now()),
+            last_move_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            last_move_time: Box::new(now),
         }
     }
     fn compose_position(x: i16, y: i16) -> u32 {
@@ -66,14 +84,32 @@ impl Player {
         self.position.store(new_pos, Ordering::SeqCst);
     }
 
-    fn get_time_receiver(&self) -> &mut watch::Receiver<Instant> {
-        let recv = &self.move_time_chan.1 as *const watch::Receiver<Instant>
-            as *mut watch::Receiver<Instant>;
-        let recv = unsafe { &mut *recv };
-        recv
+    fn change_move_time(&self, new_time: Option<Box<Instant>>) -> Option<Box<Instant>> {
+        let new_ptr = if let Some(p) = new_time {
+            Box::into_raw(p)
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let mut old_ptr = self.last_move_ptr.load(Ordering::Relaxed);
+        while let Err(ptr) = self.last_move_ptr.compare_exchange(
+            old_ptr,
+            new_ptr,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            old_ptr = ptr;
+        }
+
+        if old_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe{Box::from_raw(old_ptr)})
+        }
     }
-    fn get_time_sender(&self) -> &watch::Sender<Instant> {
-        &self.move_time_chan.0
+
+    unsafe fn set_move_time(&self, new_time: Box<Instant>) {
+        (*(self as *const Self as *mut Self)).last_move_time = new_time;
     }
 }
 
@@ -88,38 +124,60 @@ fn from_bytes<T>(bytes: &[u8]) -> &T {
     unsafe { &*(bytes.as_ptr() as *const T) }
 }
 
+async fn process_login(
+    stream: &mut net::TcpStream,
+    write_handle: &mut WriteHandle<i32, Arc<Player>, (), RandomState>,
+) -> Option<(i32, Arc<Player>)> {
+    let mut read_buf = vec![0; 256];
+    if let Err(e) = stream.read_exact(&mut read_buf[0..1]).await {
+        eprintln!("Can't process login: {}", e);
+        return None;
+    }
+
+    let total_size = read_buf[0] as usize;
+    if let Err(e) = stream.read_exact(&mut read_buf[1..total_size]).await {
+        eprintln!("Can't process login: {}", e);
+        return None;
+    }
+
+    use packet::*;
+    match SCPacketType::from(read_buf[1] as usize) {
+        SCPacketType::LoginOk => {
+            let p = from_bytes::<SCLoginOk>(&read_buf);
+            let id = p.id;
+            let player = Arc::new(Player::new(id, p.x, p.y));
+            write_handle.insert(id, player.clone());
+            write_handle.refresh();
+            Some((id, player))
+        }
+        _ => {
+            eprintln!("the server has sent a packet that isn't a login packet");
+            None
+        }
+    }
+}
+
 async fn process_packet(
     packet: &[u8],
-    my_id: &Option<i32>,
-    send: Option<oneshot::Sender<usize>>,
-) -> Option<i32> {
+    my_id: i32,
+    map_reader: PlayerMapRead,
+) {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
-        SCPacketType::LoginOk => {
-            let p = from_bytes::<SCLoginOk>(packet);
-            let mut rg = PLAYER_MAP.write().await;
-            let id = p.id;
-            let player = Player::new(id, p.x, p.y);
-            rg.insert(id, player);
-            if let Some(sender) = send {
-                sender
-                    .send(rg.get(&id).unwrap() as *const Player as usize)
-                    .unwrap();
-            }
-
-            Some(p.id)
-        }
         SCPacketType::Pos => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
 
-            if let Some(mid) = my_id {
-                if *mid == id {
-                    let rg = PLAYER_MAP.read().await;
-                    if let Some(player) = rg.get(&id) {
+            if my_id == id {
+                if let Some(it) = map_reader.get(&id) {
+                    if let Some(player) = it.iter().next() {
                         player.set_pos(p.x as i16, p.y as i16);
                         if p.seq_no > 10 {
-                            let last_time = player.get_time_receiver().recv().await.unwrap();
+                            if let Some(time) = player.change_move_time(None) {
+                                // receiver에서만 사용하므로 안전
+                                unsafe { player.set_move_time(time) }
+                            }
+                            let last_time = *player.last_move_time;
                             let now_inst = Instant::now();
                             let mut d_ms = now_inst.duration_since(last_time).as_millis();
                             if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
@@ -138,17 +196,16 @@ async fn process_packet(
                     }
                 }
             }
-            my_id.clone()
         }
-        _ => my_id.clone(),
+        _ => {}
     }
 }
 
 async fn read_packet(
     read_buf: &mut Vec<u8>,
     stream: &mut BufReader<&net::TcpStream>,
-    my_id: &mut Option<i32>,
-    player_send: Option<oneshot::Sender<usize>>,
+    my_id: i32,
+    map_reader: PlayerMapRead,
 ) {
     let read_result = stream.read_exact(&mut read_buf[..1]).await;
     if read_result.is_err() {
@@ -162,26 +219,28 @@ async fn read_packet(
     {
         return;
     }
-    *my_id = process_packet(&read_buf[..total_size], my_id, player_send).await;
+    process_packet(&read_buf[..total_size], my_id, map_reader).await;
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, player_send: oneshot::Sender<usize>) {
+async fn receiver(
+    stream: Arc<net::TcpStream>,
+    my_id: i32,
+    map_reader: PlayerMapRead,
+) {
     let mut stream = BufReader::new(&*stream);
     let mut read_buf = vec![0; 256];
-    let mut my_id = None;
-    read_packet(&mut read_buf, &mut stream, &mut my_id, Some(player_send)).await;
+{
+    let map_reader = map_reader.clone();
+    read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
+}
     loop {
-        read_packet(&mut read_buf, &mut stream, &mut my_id, None).await;
+        let map_reader = map_reader.clone();
+        read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
     }
 }
 
-async fn sender(stream: Arc<net::TcpStream>, player_recv: oneshot::Receiver<usize>) {
+async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
     let mut stream = &*stream;
-    let player;
-    {
-        let player_ptr = player_recv.await.unwrap() as *mut Player;
-        player = unsafe { &mut *player_ptr };
-    }
 
     let tele_packet = packet::CSTeleport::new();
     let p_bytes = unsafe {
@@ -191,6 +250,8 @@ async fn sender(stream: Arc<net::TcpStream>, player_recv: oneshot::Receiver<usiz
         )
     };
     stream.write_all(p_bytes).await.unwrap();
+
+    let mut move_time: Option<Box<Instant>> = None;
 
     let mut rng = StdRng::from_entropy();
     loop {
@@ -208,7 +269,13 @@ async fn sender(stream: Arc<net::TcpStream>, player_recv: oneshot::Receiver<usiz
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        player.get_time_sender().broadcast(Instant::now()).unwrap();
+        let time = if let Some(mut time) = move_time {
+            *time = Instant::now();
+            time
+        } else {
+            Box::new(Instant::now())
+        };
+        move_time = player.change_move_time(Some(time));
         if stream.write_all(bytes).await.is_err() {
             eprintln!("Can't send to the server");
             return;
@@ -218,7 +285,7 @@ async fn sender(stream: Arc<net::TcpStream>, player_recv: oneshot::Receiver<usiz
 }
 
 struct GameState {
-    executor: tokio::runtime::Runtime,
+    player_read_handle: PlayerMapRead,
 }
 
 impl EventHandler for GameState {
@@ -237,19 +304,20 @@ impl EventHandler for GameState {
         let d_mode = graphics::DrawMode::fill();
         let can_render;
         {
-            let p_map = self.executor.block_on(PLAYER_MAP.read());
-            can_render = !p_map.is_empty();
+            can_render = !self.player_read_handle.is_empty();
 
-            for player in p_map.values() {
-                let (x, y) = player.get_pos();
-                unsafe {
-                    let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                    let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                    mesh_builder.rectangle(
-                        d_mode,
-                        [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
-                        [1.0, 1.0, 1.0, 1.0].into(),
-                    );
+            for (_, players) in self.player_read_handle.read().iter() {
+                if let Some(player) = players.iter().next() {
+                    let (x, y) = player.get_pos();
+                    unsafe {
+                        let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                        let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
+                        mesh_builder.rectangle(
+                            d_mode,
+                            [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
+                            [1.0, 1.0, 1.0, 1.0].into(),
+                        );
+                    }
                 }
             }
         }
@@ -304,6 +372,12 @@ fn main() -> GameResult {
         PORT = opt.port;
         CELL_SIZE = (WINDOW_SIZE.0 as f32) / (BOARD_SIZE as f32);
     }
+
+    let (read_handle, mut write_handle) = Options::default()
+        .with_capacity(unsafe { MAX_TEST } as usize)
+        .construct();
+    let read_handle_clone = read_handle.clone();
+
     let server = async move {
         let mut handle = None;
         let mut ip_addr =
@@ -323,22 +397,25 @@ fn main() -> GameResult {
                 }
 
                 if let Ok(mut client) = net::TcpStream::connect(ip_addr).await {
+                    client.set_nodelay(true).ok();
+
+                    let login_packet = packet::CSLogin::new();
+                    let p_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            &login_packet as *const packet::CSLogin as *const u8,
+                            std::mem::size_of::<packet::CSLogin>(),
+                        )
+                    };
+                    client.write_all(p_bytes).await.unwrap();
+
+                    let (id, player) = process_login(&mut client, &mut write_handle).await.unwrap();
+
+                    let read_handle = read_handle.clone();
                     handle = Some(task::spawn(async move {
-                        client.set_nodelay(true).ok();
-
-                        let login_packet = packet::CSLogin::new();
-                        let p_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &login_packet as *const packet::CSLogin as *const u8,
-                                std::mem::size_of::<packet::CSLogin>(),
-                            )
-                        };
-                        client.write_all(p_bytes).await.unwrap();
-
                         let client = Arc::new(client);
-                        let (player_send, player_recv) = oneshot::channel();
-                        let recv = task::spawn(receiver(client.clone(), player_send));
-                        let send = task::spawn(sender(client, player_recv));
+                        let recv =
+                            task::spawn(receiver(client.clone(), id, read_handle));
+                        let send = task::spawn(sender(client, player));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                         recv.await.unwrap();
                         send.await.unwrap();
@@ -358,10 +435,7 @@ fn main() -> GameResult {
         .window_mode(win_mode);
     let (mut ctx, mut event_loop) = cb.build()?;
     let mut game_state = GameState {
-        executor: tokio::runtime::Builder::new()
-            .basic_scheduler()
-            .build()
-            .expect("Can't build a seq runtime"),
+        player_read_handle: read_handle_clone,
     };
 
     let runtime = tokio::runtime::Builder::default()
