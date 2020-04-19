@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tokio::{
-    sync::{oneshot, RwLock},
+    sync::{oneshot, watch, RwLock},
     task, time,
 };
 
@@ -38,7 +38,8 @@ lazy_static! {
 struct Player {
     _id: i32,
     position: AtomicU32,
-    seq_no: Arc<AtomicI32>,
+    seq_no: AtomicI32,
+    move_time_chan: (watch::Sender<Instant>, watch::Receiver<Instant>),
 }
 
 impl Player {
@@ -46,7 +47,8 @@ impl Player {
         Player {
             _id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
-            seq_no: Arc::new(AtomicI32::new(0)),
+            seq_no: AtomicI32::new(0),
+            move_time_chan: watch::channel(Instant::now()),
         }
     }
     fn compose_position(x: i16, y: i16) -> u32 {
@@ -54,7 +56,7 @@ impl Player {
     }
     fn get_pos(&self) -> (i16, i16) {
         let pos = self.position.load(Ordering::Relaxed);
-        let mask = 0xffffffff;
+        let mask = 0xffff;
         let x = (pos >> 16) as i16;
         let y = (pos & mask) as i16;
         (x, y)
@@ -62,6 +64,19 @@ impl Player {
     fn set_pos(&self, x: i16, y: i16) {
         let new_pos = Self::compose_position(x, y);
         self.position.store(new_pos, Ordering::SeqCst);
+    }
+
+    fn get_time_receiver(&self) -> &mut watch::Receiver<Instant> {
+        let recv = &self.move_time_chan.1 as *const watch::Receiver<Instant>
+            as *mut watch::Receiver<Instant>;
+        let recv = unsafe { &mut *recv };
+        recv
+    }
+    fn get_time_sender(&self) -> &mut watch::Sender<Instant> {
+        let send =
+            &self.move_time_chan.0 as *const watch::Sender<Instant> as *mut watch::Sender<Instant>;
+        let send = unsafe { &mut *send };
+        send
     }
 }
 
@@ -79,22 +94,25 @@ fn from_bytes<T>(bytes: &[u8]) -> &T {
 async fn process_packet(
     packet: &[u8],
     my_id: &Option<i32>,
-    send: Option<oneshot::Sender<Arc<AtomicI32>>>,
+    send: Option<oneshot::Sender<usize>>,
 ) -> Option<i32> {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
-        SCPacketType::SC_LOGIN_OK => {
+        SCPacketType::LoginOk => {
             let p = from_bytes::<SCLoginOk>(packet);
             let mut rg = PLAYER_MAP.write().await;
-            let player = Player::new(p.id, p.x, p.y);
+            let id = p.id;
+            let player = Player::new(id, p.x, p.y);
+            rg.insert(id, player);
             if let Some(sender) = send {
-                sender.send(player.seq_no.clone()).unwrap();
+                sender
+                    .send(rg.get(&id).unwrap() as *const Player as usize)
+                    .unwrap();
             }
 
-            rg.insert(p.id, player);
             Some(p.id)
         }
-        SCPacketType::SC_POS => {
+        SCPacketType::Pos => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
 
@@ -103,11 +121,17 @@ async fn process_packet(
                     let rg = PLAYER_MAP.read().await;
                     if let Some(player) = rg.get(&id) {
                         player.set_pos(p.x as i16, p.y as i16);
-                        if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
+                        if p.seq_no > 10 {
+                            let last_time = player.get_time_receiver().recv().await.unwrap();
+                            let now_inst = Instant::now();
+                            let mut d_ms = now_inst.duration_since(last_time).as_millis();
+                            if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
+                                d_ms = std::cmp::max(1000, d_ms);
+                            }
                             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                            if g_delay < DELAY_THRESHOLD {
+                            if (g_delay as u128) < d_ms {
                                 GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                            } else if g_delay > DELAY_THRESHOLD {
+                            } else if (g_delay as u128) > d_ms {
                                 GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
@@ -124,7 +148,7 @@ async fn read_packet(
     read_buf: &mut Vec<u8>,
     stream: &mut BufReader<&net::TcpStream>,
     my_id: &mut Option<i32>,
-    seq_no_send: Option<oneshot::Sender<Arc<AtomicI32>>>,
+    player_send: Option<oneshot::Sender<usize>>,
 ) {
     let read_result = stream.read_exact(&mut read_buf[..1]).await;
     if read_result.is_err() {
@@ -138,22 +162,26 @@ async fn read_packet(
     {
         return;
     }
-    *my_id = process_packet(&read_buf[..total_size], my_id, seq_no_send).await;
+    *my_id = process_packet(&read_buf[..total_size], my_id, player_send).await;
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, seq_no_send: oneshot::Sender<Arc<AtomicI32>>) {
+async fn receiver(stream: Arc<net::TcpStream>, player_send: oneshot::Sender<usize>) {
     let mut stream = BufReader::new(&*stream);
     let mut read_buf = vec![0; 256];
     let mut my_id = None;
-    read_packet(&mut read_buf, &mut stream, &mut my_id, Some(seq_no_send)).await;
+    read_packet(&mut read_buf, &mut stream, &mut my_id, Some(player_send)).await;
     loop {
         read_packet(&mut read_buf, &mut stream, &mut my_id, None).await;
     }
 }
 
-async fn sender(stream: Arc<net::TcpStream>, seq_no_recv: oneshot::Receiver<Arc<AtomicI32>>) {
+async fn sender(stream: Arc<net::TcpStream>, player_recv: oneshot::Receiver<usize>) {
     let mut stream = &*stream;
-    let player_seq_no = seq_no_recv.await.unwrap();
+    let player;
+    {
+        let player_ptr = player_recv.await.unwrap() as *mut Player;
+        player = unsafe { &mut *player_ptr };
+    }
 
     let tele_packet = packet::CSTeleport::new();
     let p_bytes = unsafe {
@@ -164,26 +192,15 @@ async fn sender(stream: Arc<net::TcpStream>, seq_no_recv: oneshot::Receiver<Arc<
     };
     stream.write_all(p_bytes).await.unwrap();
 
-    let packets = [
-        packet::CSMove::new(
-            packet::Direction::D_UP,
-            player_seq_no.fetch_add(1, Ordering::Relaxed) + 1,
-        ),
-        packet::CSMove::new(
-            packet::Direction::D_DOWN,
-            player_seq_no.fetch_add(1, Ordering::Relaxed) + 1,
-        ),
-        packet::CSMove::new(
-            packet::Direction::D_LEFT,
-            player_seq_no.fetch_add(1, Ordering::Relaxed) + 1,
-        ),
-        packet::CSMove::new(
-            packet::Direction::D_RIGHT,
-            player_seq_no.fetch_add(1, Ordering::Relaxed) + 1,
-        ),
-    ];
     let mut rng = StdRng::from_entropy();
     loop {
+        let seq_no = player.seq_no.fetch_add(1, Ordering::Relaxed) + 1;
+        let packets = [
+            packet::CSMove::new(packet::Direction::Up, seq_no),
+            packet::CSMove::new(packet::Direction::Down, seq_no),
+            packet::CSMove::new(packet::Direction::Left, seq_no),
+            packet::CSMove::new(packet::Direction::Right, seq_no),
+        ];
         let picked_packet = &packets[rng.gen_range(0, packets.len())];
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -191,7 +208,7 @@ async fn sender(stream: Arc<net::TcpStream>, seq_no_recv: oneshot::Receiver<Arc<
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        // stream.write_all(bytes).await.expect("Can't send to server");
+        player.get_time_sender().broadcast(Instant::now()).unwrap();
         if stream.write_all(bytes).await.is_err() {
             eprintln!("Can't send to the server");
             return;
@@ -241,7 +258,11 @@ impl EventHandler for GameState {
                 .build(ctx)?
                 .draw(ctx, graphics::DrawParam::new())?;
 
-            let delay_s = format!("Delay: {} ms", GLOBAL_DELAY.load(Ordering::Relaxed));
+            let delay_s = format!(
+                "Delay: {} ms, Player: {}",
+                GLOBAL_DELAY.load(Ordering::Relaxed),
+                PLAYER_NUM.load(Ordering::Relaxed)
+            );
             graphics::Text::new(delay_s).draw(ctx, graphics::DrawParam::new())?;
         }
         graphics::present(ctx)
@@ -297,8 +318,8 @@ fn main() -> GameResult {
             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed) as u64;
 
             if g_delay < DELAY_THRESHOLD as u64 {
-                if g_delay != 0 {
-                    delay = rng.gen_range(0, g_delay);
+                if g_delay != 0 && g_delay > 50 {
+                    delay = rng.gen_range(50, g_delay);
                 }
 
                 if let Ok(mut client) = net::TcpStream::connect(ip_addr).await {
@@ -318,8 +339,7 @@ fn main() -> GameResult {
                         let (player_send, player_recv) = oneshot::channel();
                         let recv = task::spawn(receiver(client.clone(), player_send));
                         let send = task::spawn(sender(client, player_recv));
-                        let num = PLAYER_NUM.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!("Current Player Num: {}", num);
+                        PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                         recv.await.unwrap();
                         send.await.unwrap();
                     }));

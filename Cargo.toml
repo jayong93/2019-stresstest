@@ -1,5 +1,5 @@
 [package]
-name = "Rust-PL-Stresstest"
+name = "rust_pl_stresstest"
 version = "0.1.0"
 authors = ["Jaeyong Choi <jayong93@gmail.com>"]
 edition = "2018"

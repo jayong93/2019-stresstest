@@ -8,13 +8,14 @@ pub struct PacketHeader {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 pub enum SCPacketType {
-    SC_LOGIN_OK = 1,
-    SC_LOGIN_FAIL,
-    SC_POS,
-    SC_PUT,
-    SC_REMOVE,
-    SC_CHAT,
+    LoginOk = 1,
+    LoginFail,
+    Pos,
+    Put,
+    Remove,
+    Chat,
 }
 
 impl From<usize> for SCPacketType {
@@ -30,16 +31,20 @@ impl From<usize> for SCPacketType {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(dead_code)]
 enum CSPacketType {
-    CS_LOGIN = 1,
-    CS_MOVE,
-    CS_ATTACK,
-    CS_CHAT,
-    CS_LOGOUT,
-    CS_TELEPORT,
+    Login = 1,
+    Move,
+    Attack,
+    Chat,
+    Logout,
+    Teleport,
 }
 
 #[repr(C, packed(1))]
+#[allow(dead_code)]
 pub struct SCPutPlayer {
     pub header: PacketHeader,
     pub id: i32,
@@ -83,10 +88,10 @@ pub struct CSTeleport {
 
 #[repr(C)]
 pub enum Direction {
-    D_UP = 0,
-    D_DOWN,
-    D_LEFT,
-    D_RIGHT,
+    Up = 0,
+    Down,
+    Left,
+    Right,
 }
 
 impl CSMove {
@@ -94,7 +99,7 @@ impl CSMove {
         Self {
             header: PacketHeader {
                 size: size_of::<Self>() as i8,
-                p_type: CSPacketType::CS_MOVE as i8,
+                p_type: CSPacketType::Move as i8,
             },
             direction: direction as i8,
             seq_no,
@@ -107,7 +112,7 @@ impl CSLogin {
         Self {
             header: PacketHeader {
                 size: size_of::<Self>() as i8,
-                p_type: CSPacketType::CS_LOGIN as i8,
+                p_type: CSPacketType::Login as i8,
             },
             id: [0i8; 50],
         }
@@ -119,7 +124,7 @@ impl CSTeleport {
         Self {
             header: PacketHeader {
                 size: size_of::<Self>() as i8,
-                p_type: CSPacketType::CS_TELEPORT as i8,
+                p_type: CSPacketType::Teleport as i8,
             },
         }
     }
