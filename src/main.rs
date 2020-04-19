@@ -160,7 +160,7 @@ async fn process_login(
     }
 }
 
-async fn process_packet(packet: &[u8], my_id: i32, map_reader: PlayerMapRead) {
+fn process_packet(packet: &[u8], my_id: i32, map_reader: PlayerMapRead) {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
         SCPacketType::Pos => {
@@ -214,7 +214,9 @@ async fn read_packet(
     {
         return;
     }
-    process_packet(&read_buf[..total_size], my_id, map_reader).await;
+
+    let packet = &read_buf[..total_size];
+    task::block_in_place(|| process_packet(packet, my_id, map_reader));
 }
 
 async fn receiver(stream: Arc<net::TcpStream>, my_id: i32, map_reader: PlayerMapRead) {
