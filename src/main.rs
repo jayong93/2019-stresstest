@@ -72,11 +72,8 @@ impl Player {
         let recv = unsafe { &mut *recv };
         recv
     }
-    fn get_time_sender(&self) -> &mut watch::Sender<Instant> {
-        let send =
-            &self.move_time_chan.0 as *const watch::Sender<Instant> as *mut watch::Sender<Instant>;
-        let send = unsafe { &mut *send };
-        send
+    fn get_time_sender(&self) -> &watch::Sender<Instant> {
+        &self.move_time_chan.0
     }
 }
 
@@ -126,13 +123,16 @@ async fn process_packet(
                             let now_inst = Instant::now();
                             let mut d_ms = now_inst.duration_since(last_time).as_millis();
                             if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
-                                d_ms = std::cmp::max(1000, d_ms);
+                                d_ms = std::cmp::max(DELAY_THRESHOLD as u128, d_ms);
                             }
                             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
                             if (g_delay as u128) < d_ms {
                                 GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
                             } else if (g_delay as u128) > d_ms {
-                                GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
+                                let g_delay = GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
+                                if g_delay == 0 {
+                                    GLOBAL_DELAY.store(0, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -318,7 +318,7 @@ fn main() -> GameResult {
             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed) as u64;
 
             if g_delay < DELAY_THRESHOLD as u64 {
-                if g_delay != 0 && g_delay > 50 {
+                if g_delay > 50 {
                     delay = rng.gen_range(50, g_delay);
                 }
 
