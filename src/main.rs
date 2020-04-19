@@ -35,7 +35,7 @@ struct Player {
     position: AtomicU32,
     seq_no: AtomicI32,
     last_move_ptr: AtomicPtr<Instant>,
-    last_move_time: Box<Instant>,
+    last_move_time: Option<Box<Instant>>,
 }
 
 impl Drop for Player {
@@ -65,8 +65,8 @@ impl Player {
             _id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
             seq_no: AtomicI32::new(0),
-            last_move_ptr: AtomicPtr::new(std::ptr::null_mut()),
-            last_move_time: Box::new(now),
+            last_move_ptr: AtomicPtr::new(Box::into_raw(Box::new(now))),
+            last_move_time: Some(Box::new(now)),
         }
     }
     fn compose_position(x: i16, y: i16) -> u32 {
@@ -95,7 +95,7 @@ impl Player {
         while let Err(ptr) = self.last_move_ptr.compare_exchange(
             old_ptr,
             new_ptr,
-            Ordering::SeqCst,
+            Ordering::Release,
             Ordering::Relaxed,
         ) {
             old_ptr = ptr;
@@ -104,12 +104,15 @@ impl Player {
         if old_ptr.is_null() {
             None
         } else {
-            Some(unsafe{Box::from_raw(old_ptr)})
+            Some(unsafe { Box::from_raw(old_ptr) })
         }
     }
 
-    unsafe fn set_move_time(&self, new_time: Box<Instant>) {
-        (*(self as *const Self as *mut Self)).last_move_time = new_time;
+    unsafe fn recv_move_time(&self) -> Instant {
+        let m_p = &mut *(self as *const Self as *mut Self);
+        let old_time = std::mem::take(&mut m_p.last_move_time);
+        m_p.last_move_time = self.change_move_time(old_time);
+        **m_p.last_move_time.as_ref().unwrap()
     }
 }
 
@@ -143,7 +146,7 @@ async fn process_login(
     use packet::*;
     match SCPacketType::from(read_buf[1] as usize) {
         SCPacketType::LoginOk => {
-            let p = from_bytes::<SCLoginOk>(&read_buf);
+            let p = from_bytes::<SCLoginOk>(&read_buf[0..total_size]);
             let id = p.id;
             let player = Arc::new(Player::new(id, p.x, p.y));
             write_handle.insert(id, player.clone());
@@ -157,11 +160,7 @@ async fn process_login(
     }
 }
 
-async fn process_packet(
-    packet: &[u8],
-    my_id: i32,
-    map_reader: PlayerMapRead,
-) {
+async fn process_packet(packet: &[u8], my_id: i32, map_reader: PlayerMapRead) {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
         SCPacketType::Pos => {
@@ -173,11 +172,7 @@ async fn process_packet(
                     if let Some(player) = it.iter().next() {
                         player.set_pos(p.x as i16, p.y as i16);
                         if p.seq_no > 10 {
-                            if let Some(time) = player.change_move_time(None) {
-                                // receiver에서만 사용하므로 안전
-                                unsafe { player.set_move_time(time) }
-                            }
-                            let last_time = *player.last_move_time;
+                            let last_time = unsafe { player.recv_move_time() };
                             let now_inst = Instant::now();
                             let mut d_ms = now_inst.duration_since(last_time).as_millis();
                             if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
@@ -222,17 +217,13 @@ async fn read_packet(
     process_packet(&read_buf[..total_size], my_id, map_reader).await;
 }
 
-async fn receiver(
-    stream: Arc<net::TcpStream>,
-    my_id: i32,
-    map_reader: PlayerMapRead,
-) {
+async fn receiver(stream: Arc<net::TcpStream>, my_id: i32, map_reader: PlayerMapRead) {
     let mut stream = BufReader::new(&*stream);
     let mut read_buf = vec![0; 256];
-{
-    let map_reader = map_reader.clone();
-    read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
-}
+    {
+        let map_reader = map_reader.clone();
+        read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
+    }
     loop {
         let map_reader = map_reader.clone();
         read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
@@ -251,7 +242,7 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
     };
     stream.write_all(p_bytes).await.unwrap();
 
-    let mut move_time: Option<Box<Instant>> = None;
+    let mut move_time: Option<Box<Instant>> = Some(Box::new(Instant::now()));
 
     let mut rng = StdRng::from_entropy();
     loop {
@@ -269,13 +260,8 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        let time = if let Some(mut time) = move_time {
-            *time = Instant::now();
-            time
-        } else {
-            Box::new(Instant::now())
-        };
-        move_time = player.change_move_time(Some(time));
+        **(move_time.as_mut().unwrap()) = Instant::now();
+        move_time = player.change_move_time(move_time);
         if stream.write_all(bytes).await.is_err() {
             eprintln!("Can't send to the server");
             return;
@@ -413,8 +399,7 @@ fn main() -> GameResult {
                     let read_handle = read_handle.clone();
                     handle = Some(task::spawn(async move {
                         let client = Arc::new(client);
-                        let recv =
-                            task::spawn(receiver(client.clone(), id, read_handle));
+                        let recv = task::spawn(receiver(client.clone(), id, read_handle));
                         let send = task::spawn(sender(client, player));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                         recv.await.unwrap();
