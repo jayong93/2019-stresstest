@@ -160,7 +160,7 @@ async fn process_login(
     }
 }
 
-fn process_packet(packet: &[u8], my_id: i32, map_reader: PlayerMapRead) {
+fn process_packet(packet: &[u8], my_id: i32, player: &Arc<Player>) {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
         SCPacketType::Pos => {
@@ -168,25 +168,21 @@ fn process_packet(packet: &[u8], my_id: i32, map_reader: PlayerMapRead) {
             let id = p.id;
 
             if my_id == id {
-                if let Some(it) = map_reader.get(&id) {
-                    if let Some(player) = it.iter().next() {
-                        player.set_pos(p.x as i16, p.y as i16);
-                        if p.seq_no > 10 {
-                            let last_time = unsafe { player.recv_move_time() };
-                            let now_inst = Instant::now();
-                            let mut d_ms = now_inst.duration_since(last_time).as_millis();
-                            if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
-                                d_ms = std::cmp::max(DELAY_THRESHOLD as u128, d_ms);
-                            }
-                            let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                            if (g_delay as u128) < d_ms {
-                                GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                            } else if (g_delay as u128) > d_ms {
-                                let g_delay = GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
-                                if g_delay == 0 {
-                                    GLOBAL_DELAY.store(0, Ordering::Relaxed);
-                                }
-                            }
+                player.set_pos(p.x as i16, p.y as i16);
+                if p.seq_no > 10 {
+                    let last_time = unsafe { player.recv_move_time() };
+                    let now_inst = Instant::now();
+                    let mut d_ms = now_inst.duration_since(last_time).as_millis();
+                    if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
+                        d_ms = std::cmp::max(DELAY_THRESHOLD as u128, d_ms);
+                    }
+                    let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+                    if (g_delay as u128) < d_ms {
+                        GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
+                    } else if (g_delay as u128) > d_ms {
+                        let g_delay = GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
+                        if g_delay == 0 {
+                            GLOBAL_DELAY.store(0, Ordering::Relaxed);
                         }
                     }
                 }
@@ -200,40 +196,39 @@ async fn read_packet(
     read_buf: &mut Vec<u8>,
     stream: &mut BufReader<&net::TcpStream>,
     my_id: i32,
-    map_reader: PlayerMapRead,
-) {
-    let read_result = stream.read_exact(&mut read_buf[..1]).await;
-    if read_result.is_err() {
-        return;
-    }
+    player: &Arc<Player>,
+) -> Result<(), ()> {
+    stream
+        .read_exact(&mut read_buf[..1])
+        .await
+        .map_err(|_| ())?;
     let total_size = read_buf[0] as usize;
-    if stream
+    stream
         .read_exact(&mut read_buf[1..total_size])
         .await
-        .is_err()
-    {
-        return;
-    }
+        .map_err(|_| ())?;
 
     let packet = &read_buf[..total_size];
-    task::block_in_place(|| process_packet(packet, my_id, map_reader));
+    task::block_in_place(|| process_packet(packet, my_id, player));
+    Ok(())
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, my_id: i32, map_reader: PlayerMapRead) {
+async fn receiver(stream: Arc<net::TcpStream>, my_id: i32, player: Arc<Player>) {
     let mut stream = BufReader::new(&*stream);
     let mut read_buf = vec![0; 256];
-    {
-        let map_reader = map_reader.clone();
-        read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
-    }
     loop {
-        let map_reader = map_reader.clone();
-        read_packet(&mut read_buf, &mut stream, my_id, map_reader).await;
+        if read_packet(&mut read_buf, &mut stream, my_id, &player)
+            .await
+            .is_err()
+        {
+            eprintln!("Error occured in read_packet");
+            return;
+        }
     }
 }
 
 async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
-    let mut stream = &*stream;
+    let mut stream = stream.as_ref();
 
     let tele_packet = packet::CSTeleport::new();
     let p_bytes = unsafe {
@@ -315,7 +310,7 @@ impl EventHandler for GameState {
                 .draw(ctx, graphics::DrawParam::new())?;
 
             let delay_s = format!(
-                "Delay: {} ms, Player: {}",
+                "Delay: {} ms\nPlayer: {}",
                 GLOBAL_DELAY.load(Ordering::Relaxed),
                 PLAYER_NUM.load(Ordering::Relaxed)
             );
@@ -375,6 +370,7 @@ fn main() -> GameResult {
         ip_addr.set_port(unsafe { PORT });
 
         let mut rng = StdRng::from_entropy();
+        let mut last_login_time = Instant::now();
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             let mut delay = 50;
             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed) as u64;
@@ -383,6 +379,12 @@ fn main() -> GameResult {
                 if g_delay > 50 {
                     delay = rng.gen_range(50, g_delay);
                 }
+
+                if last_login_time.elapsed().as_millis() < delay as u128 {
+                    task::yield_now().await;
+                    continue;
+                }
+                last_login_time = Instant::now();
 
                 if let Ok(mut client) = net::TcpStream::connect(ip_addr).await {
                     client.set_nodelay(true).ok();
@@ -398,10 +400,9 @@ fn main() -> GameResult {
 
                     let (id, player) = process_login(&mut client, &mut write_handle).await.unwrap();
 
-                    let read_handle = read_handle.clone();
                     handle = Some(task::spawn(async move {
                         let client = Arc::new(client);
-                        let recv = task::spawn(receiver(client.clone(), id, read_handle));
+                        let recv = task::spawn(receiver(client.clone(), id, player.clone()));
                         let send = task::spawn(sender(client, player));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                         recv.await.unwrap();
@@ -409,7 +410,6 @@ fn main() -> GameResult {
                     }));
                 }
             }
-            time::delay_for(Duration::from_millis(delay)).await;
         }
         handle.unwrap().await.unwrap();
     };
