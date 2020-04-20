@@ -1,6 +1,6 @@
 use async_std::{
     io::{prelude::*, BufReader},
-    net,
+    net, task,
 };
 use evmap::{self, Options, ReadHandle, WriteHandle};
 use ggez::conf::{WindowMode, WindowSetup};
@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
-use tokio::{task, time};
 
 mod packet;
 
@@ -203,13 +202,18 @@ async fn read_packet(
         .await
         .map_err(|_| ())?;
     let total_size = read_buf[0] as usize;
+    if total_size <= 0 {
+        eprintln!("a packet has 0 size");
+        return Err(());
+    }
+
     stream
         .read_exact(&mut read_buf[1..total_size])
         .await
         .map_err(|_| ())?;
 
     let packet = &read_buf[..total_size];
-    task::block_in_place(|| process_packet(packet, my_id, player));
+    process_packet(packet, my_id, player);
     Ok(())
 }
 
@@ -263,7 +267,7 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
             eprintln!("Can't send to the server");
             return;
         }
-        time::delay_for(Duration::from_millis(1000)).await;
+        task::sleep(Duration::from_millis(1000)).await;
     }
 }
 
@@ -338,7 +342,8 @@ struct CmdOption {
     ip_addr: String,
 }
 
-fn main() -> GameResult {
+#[async_std::main]
+async fn main() -> GameResult {
     let opt = CmdOption::from_args();
     unsafe {
         MAX_TEST = opt.max_player as u64;
@@ -384,7 +389,7 @@ fn main() -> GameResult {
                     task::yield_now().await;
                     continue;
                 }
-                last_login_time = Instant::now();
+                last_login_time += Duration::from_millis(delay);
 
                 if let Ok(mut client) = net::TcpStream::connect(ip_addr).await {
                     client.set_nodelay(true).ok();
@@ -405,31 +410,28 @@ fn main() -> GameResult {
                         let recv = task::spawn(receiver(client.clone(), id, player.clone()));
                         let send = task::spawn(sender(client, player));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
-                        recv.await.unwrap();
-                        send.await.unwrap();
+                        recv.await;
+                        send.await;
                     }));
                 }
             }
         }
-        handle.unwrap().await.unwrap();
+        handle.unwrap().await;
     };
+    task::spawn(server);
 
-    let setup = WindowSetup::default().title("Stress Test");
-    let win_mode =
-        unsafe { WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32) };
-    let cb = ContextBuilder::new("PL-StressTest", "CJY")
-        .window_setup(setup)
-        .window_mode(win_mode);
-    let (mut ctx, mut event_loop) = cb.build()?;
-    let mut game_state = GameState {
-        player_read_handle: read_handle_clone,
-    };
-
-    let runtime = tokio::runtime::Builder::default()
-        .threaded_scheduler()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.spawn(server);
-    event::run(&mut ctx, &mut event_loop, &mut game_state)
+    task::spawn_blocking(|| {
+        let setup = WindowSetup::default().title("Stress Test");
+        let win_mode =
+            unsafe { WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32) };
+        let cb = ContextBuilder::new("PL-StressTest", "CJY")
+            .window_setup(setup)
+            .window_mode(win_mode);
+        let (mut ctx, mut event_loop) = cb.build()?;
+        let mut game_state = GameState {
+            player_read_handle: read_handle_clone,
+        };
+        event::run(&mut ctx, &mut event_loop, &mut game_state)
+    })
+    .await
 }
