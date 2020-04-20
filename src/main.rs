@@ -9,6 +9,7 @@ use ggez::graphics;
 use ggez::graphics::Drawable;
 use ggez::{Context, ContextBuilder, GameResult};
 use rand::prelude::*;
+use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -30,12 +31,19 @@ static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
 const DELAY_THRESHOLD: usize = 1000;
 
 struct Player {
-    _id: i32,
+    id: i32,
     position: AtomicU32,
     seq_no: AtomicI32,
     last_move_ptr: AtomicPtr<Instant>,
-    last_move_time: Option<Box<Instant>>,
+    last_move_time: UnsafeCell<Option<Box<Instant>>>,
+    last_delay: AtomicUsize,
+    recv_buf: UnsafeCell<Vec<u8>>,
+    packet_buf: UnsafeCell<Vec<u8>>,
 }
+
+// recv_buf, packet_buf, last_move_time은 receiver에서만 접근.
+// receiver는 한번에 한 thread만 호출할 수 있으므로 안전.
+unsafe impl Sync for Player {}
 
 impl Drop for Player {
     fn drop(&mut self) {
@@ -45,7 +53,7 @@ impl Drop for Player {
 
 impl PartialEq for Player {
     fn eq(&self, other: &Self) -> bool {
-        self._id == other._id
+        self.id == other.id
     }
 }
 
@@ -53,19 +61,24 @@ impl Eq for Player {}
 
 impl std::hash::Hash for Player {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self._id.hash(state);
+        self.id.hash(state);
     }
 }
+
+const RECV_SIZE: usize = 1024;
 
 impl Player {
     fn new(id: i32, x: i16, y: i16) -> Self {
         let now = Instant::now();
         Player {
-            _id: id,
+            id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
             seq_no: AtomicI32::new(0),
             last_move_ptr: AtomicPtr::new(Box::into_raw(Box::new(now))),
-            last_move_time: Some(Box::new(now)),
+            last_move_time: UnsafeCell::new(Some(Box::new(now))),
+            last_delay: AtomicUsize::new(0),
+            packet_buf: UnsafeCell::new(Vec::with_capacity(RECV_SIZE * 2)),
+            recv_buf: UnsafeCell::new(vec![0; RECV_SIZE]),
         }
     }
     fn compose_position(x: i16, y: i16) -> u32 {
@@ -108,10 +121,10 @@ impl Player {
     }
 
     unsafe fn recv_move_time(&self) -> Instant {
-        let m_p = &mut *(self as *const Self as *mut Self);
-        let old_time = std::mem::take(&mut m_p.last_move_time);
-        m_p.last_move_time = self.change_move_time(old_time);
-        **m_p.last_move_time.as_ref().unwrap()
+        let mut_time = &mut *self.last_move_time.get();
+        let old_time = std::mem::take(mut_time);
+        *mut_time = self.change_move_time(old_time);
+        **(mut_time.as_ref().unwrap())
     }
 }
 
@@ -129,7 +142,7 @@ fn from_bytes<T>(bytes: &[u8]) -> &T {
 async fn process_login(
     stream: &mut net::TcpStream,
     write_handle: &mut WriteHandle<i32, Arc<Player>, (), RandomState>,
-) -> Option<(i32, Arc<Player>)> {
+) -> Option<Arc<Player>> {
     let mut read_buf = vec![0; 256];
     if let Err(e) = stream.read_exact(&mut read_buf[0..1]).await {
         eprintln!("Can't process login: {}", e);
@@ -150,7 +163,7 @@ async fn process_login(
             let player = Arc::new(Player::new(id, p.x, p.y));
             write_handle.insert(id, player.clone());
             write_handle.refresh();
-            Some((id, player))
+            Some(player)
         }
         _ => {
             eprintln!("the server has sent a packet that isn't a login packet");
@@ -159,22 +172,56 @@ async fn process_login(
     }
 }
 
-fn process_packet(packet: &[u8], my_id: i32, player: &Arc<Player>) {
+fn assemble_packet(player: Arc<Player>, mut received_size: usize) {
+    unsafe {
+        let recv_buf = &mut *player.recv_buf.get();
+        let prev_buf = &mut *player.packet_buf.get();
+        let mut packet = [0u8; 256];
+        let mut recv_buf = &mut recv_buf[..];
+
+        while received_size > 0 {
+            let prev_len = prev_buf.len();
+            let packet_size = if prev_len > 0 {
+                prev_buf[0]
+            } else {
+                recv_buf[0]
+            } as usize;
+
+            if prev_len + received_size >= packet_size {
+                let copied_size = packet_size - prev_len;
+                packet[..prev_len].copy_from_slice(prev_buf);
+                packet[prev_len..packet_size].copy_from_slice(&recv_buf[..copied_size]);
+                recv_buf = &mut recv_buf[copied_size..];
+                prev_buf.clear();
+                received_size -= copied_size;
+
+                process_packet(&packet[..packet_size], &player);
+            } else {
+                prev_buf.reserve(prev_len + received_size);
+                prev_buf.set_len(prev_len + received_size);
+                prev_buf[prev_len..].copy_from_slice(&recv_buf[..received_size]);
+                return;
+            }
+        }
+    }
+}
+
+fn process_packet(packet: &[u8], player: &Arc<Player>) {
     use packet::*;
     match SCPacketType::from(packet[1] as usize) {
         SCPacketType::Pos => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
 
-            if my_id == id {
+            if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
                 if p.seq_no > 10 {
                     let last_time = unsafe { player.recv_move_time() };
-                    let now_inst = Instant::now();
-                    let mut d_ms = now_inst.duration_since(last_time).as_millis();
+                    let mut d_ms = last_time.elapsed().as_millis();
                     if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
                         d_ms = std::cmp::max(DELAY_THRESHOLD as u128, d_ms);
                     }
+                    player.last_delay.store(d_ms as usize, Ordering::Relaxed);
                     let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
                     if (g_delay as u128) < d_ms {
                         GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
@@ -192,39 +239,37 @@ fn process_packet(packet: &[u8], my_id: i32, player: &Arc<Player>) {
 }
 
 async fn read_packet(
-    read_buf: &mut Vec<u8>,
     stream: &mut BufReader<&net::TcpStream>,
-    my_id: i32,
     player: &Arc<Player>,
 ) -> Result<(), ()> {
-    stream
-        .read_exact(&mut read_buf[..1])
+    let read_buf;
+    {
+        let read_ptr = player.recv_buf.get();
+        read_buf = unsafe { &mut *read_ptr };
+    }
+    let read_size = stream
+        .read(read_buf.as_mut_slice())
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| eprintln!("{}", e))?;
+    if read_size == 0 {
+        eprintln!("Read zero byte");
+        return Err(());
+    }
     let total_size = read_buf[0] as usize;
     if total_size <= 0 {
         eprintln!("a packet has 0 size");
         return Err(());
     }
 
-    stream
-        .read_exact(&mut read_buf[1..total_size])
-        .await
-        .map_err(|_| ())?;
-
-    let packet = &read_buf[..total_size];
-    process_packet(packet, my_id, player);
+    let player = player.clone();
+    task::spawn_blocking(move || assemble_packet(player, read_size)).await;
     Ok(())
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, my_id: i32, player: Arc<Player>) {
+async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>) {
     let mut stream = BufReader::new(&*stream);
-    let mut read_buf = vec![0; 256];
     loop {
-        if read_packet(&mut read_buf, &mut stream, my_id, &player)
-            .await
-            .is_err()
-        {
+        if read_packet(&mut stream, &player).await.is_err() {
             eprintln!("Error occured in read_packet");
             return;
         }
@@ -245,16 +290,18 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
 
     let mut move_time: Option<Box<Instant>> = Some(Box::new(Instant::now()));
 
+    let mut packets = [
+        packet::CSMove::new(packet::Direction::Up, 0),
+        packet::CSMove::new(packet::Direction::Down, 0),
+        packet::CSMove::new(packet::Direction::Left, 0),
+        packet::CSMove::new(packet::Direction::Right, 0),
+    ];
     let mut rng = StdRng::from_entropy();
     loop {
         let seq_no = player.seq_no.fetch_add(1, Ordering::Relaxed) + 1;
-        let packets = [
-            packet::CSMove::new(packet::Direction::Up, seq_no),
-            packet::CSMove::new(packet::Direction::Down, seq_no),
-            packet::CSMove::new(packet::Direction::Left, seq_no),
-            packet::CSMove::new(packet::Direction::Right, seq_no),
-        ];
-        let picked_packet = &packets[rng.gen_range(0, packets.len())];
+        let picked_packet = &mut packets[rng.gen_range(0, packets.len())];
+        picked_packet.seq_no = seq_no;
+
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 picked_packet as *const packet::CSMove as *const u8,
@@ -290,6 +337,8 @@ impl EventHandler for GameState {
         let mut mesh_builder = graphics::MeshBuilder::new();
         let d_mode = graphics::DrawMode::fill();
         let can_render;
+        let mut delay_sum = 0;
+        let mut player_num = 0usize;
         {
             can_render = !self.player_read_handle.is_empty();
 
@@ -305,6 +354,9 @@ impl EventHandler for GameState {
                             [1.0, 1.0, 1.0, 1.0].into(),
                         );
                     }
+
+                    delay_sum += player.last_delay.load(Ordering::Relaxed);
+                    player_num += 1;
                 }
             }
         }
@@ -314,8 +366,9 @@ impl EventHandler for GameState {
                 .draw(ctx, graphics::DrawParam::new())?;
 
             let delay_s = format!(
-                "Delay: {} ms\nPlayer: {}",
+                "Delay: {} ms\nAverage Delay: {} ms\nPlayer: {}",
                 GLOBAL_DELAY.load(Ordering::Relaxed),
+                delay_sum / player_num,
                 PLAYER_NUM.load(Ordering::Relaxed)
             );
             graphics::Text::new(delay_s).draw(ctx, graphics::DrawParam::new())?;
@@ -403,11 +456,11 @@ async fn main() -> GameResult {
                     };
                     client.write_all(p_bytes).await.unwrap();
 
-                    let (id, player) = process_login(&mut client, &mut write_handle).await.unwrap();
+                    let player = process_login(&mut client, &mut write_handle).await.unwrap();
 
                     handle = Some(task::spawn(async move {
                         let client = Arc::new(client);
-                        let recv = task::spawn(receiver(client.clone(), id, player.clone()));
+                        let recv = task::spawn(receiver(client.clone(), player.clone()));
                         let send = task::spawn(sender(client, player));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                         recv.await;
