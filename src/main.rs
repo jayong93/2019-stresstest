@@ -172,7 +172,7 @@ async fn process_login(
     }
 }
 
-fn assemble_packet(player: Arc<Player>, mut received_size: usize) {
+fn assemble_packet(player: Arc<Player>, mut received_size: usize) -> Arc<Player> {
     unsafe {
         let recv_buf = &mut *player.recv_buf.get();
         let prev_buf = &mut *player.packet_buf.get();
@@ -200,10 +200,11 @@ fn assemble_packet(player: Arc<Player>, mut received_size: usize) {
                 prev_buf.reserve(prev_len + received_size);
                 prev_buf.set_len(prev_len + received_size);
                 prev_buf[prev_len..].copy_from_slice(&recv_buf[..received_size]);
-                return;
+                break;
             }
         }
     }
+    player
 }
 
 fn process_packet(packet: &[u8], player: &Arc<Player>) {
@@ -240,8 +241,8 @@ fn process_packet(packet: &[u8], player: &Arc<Player>) {
 
 async fn read_packet(
     stream: &mut BufReader<&net::TcpStream>,
-    player: &Arc<Player>,
-) -> Result<(), ()> {
+    player: Arc<Player>,
+) -> Result<Arc<Player>, ()> {
     let read_buf;
     {
         let read_ptr = player.recv_buf.get();
@@ -261,15 +262,15 @@ async fn read_packet(
         return Err(());
     }
 
-    let player = player.clone();
-    task::spawn_blocking(move || assemble_packet(player, read_size)).await;
-    Ok(())
+    Ok(task::spawn_blocking(move || assemble_packet(player, read_size)).await)
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>) {
+async fn receiver(stream: Arc<net::TcpStream>, mut player: Arc<Player>) {
     let mut stream = BufReader::new(&*stream);
     loop {
-        if read_packet(&mut stream, &player).await.is_err() {
+        if let Ok(p) = read_packet(&mut stream, player).await {
+            player = p
+        } else {
             eprintln!("Error occured in read_packet");
             return;
         }
