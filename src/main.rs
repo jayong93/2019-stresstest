@@ -412,7 +412,7 @@ async fn main() -> GameResult {
                 client_to_disconnect += 1;
                 continue;
             } else if DELAY_THRESHOLD < g_delay {
-                delay_multiplier = 10;
+                delay_multiplier = 2;
                 continue;
             }
 
