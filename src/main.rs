@@ -8,6 +8,7 @@ use ggez::event::{self, EventHandler};
 use ggez::graphics;
 use ggez::graphics::Drawable;
 use ggez::{Context, ContextBuilder, GameResult};
+use num::FromPrimitive;
 use rand::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
@@ -115,8 +116,8 @@ async fn process_login(
     }
 
     use packet::*;
-    match SCPacketType::from(read_buf[1] as usize) {
-        SCPacketType::LoginOk => {
+    match FromPrimitive::from_u8(read_buf[1]) {
+        Some(SCPacketType::LoginOk) => {
             let p = from_bytes::<SCLoginOk>(&read_buf[0..total_size]);
             let id = p.id;
             let player = Arc::new(Player::new(id, p.x, p.y));
@@ -124,8 +125,15 @@ async fn process_login(
             write_handle.refresh();
             Some(player)
         }
-        p @ _ => {
-            eprintln!("the server has sent a packet that isn't a login packet.\nIt was:\n{:#?}", p);
+        Some(p) => {
+            eprintln!(
+                "the server has sent a packet that isn't a login packet. It was {:#?}",
+                p
+            );
+            None
+        }
+        _ => {
+            eprintln!("the server has sent unknown packet type {}", read_buf[1]);
             None
         }
     }
@@ -168,8 +176,8 @@ fn assemble_packet(player: Arc<Player>, mut received_size: usize) -> Arc<Player>
 
 fn process_packet(packet: &[u8], player: &Arc<Player>) {
     use packet::{SCPacketType, SCPosPlayer};
-    match SCPacketType::from(packet[1] as usize) {
-        SCPacketType::Pos => {
+    match FromPrimitive::from_u8(packet[1]) {
+        Some(SCPacketType::Pos) => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
 

@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use num_derive::FromPrimitive;
 
 #[repr(C, packed(1))]
 pub struct PacketHeader {
@@ -7,7 +8,7 @@ pub struct PacketHeader {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, FromPrimitive)]
 #[allow(dead_code)]
 pub enum SCPacketType {
     LoginOk = 1,
@@ -16,19 +17,7 @@ pub enum SCPacketType {
     Put,
     Remove,
     Chat,
-}
-
-impl From<usize> for SCPacketType {
-    fn from(value: usize) -> Self {
-        let p = match size_of::<Self>() {
-            1 => &(value as u8) as *const u8 as *const Self,
-            2 => &(value as u16) as *const u16 as *const Self,
-            4 => &(value as u32) as *const u32 as *const Self,
-            8 => &(value as u64) as *const u64 as *const Self,
-            _ => unreachable!(),
-        };
-        unsafe { *p }
-    }
+    Unknown,
 }
 
 #[repr(C)]
