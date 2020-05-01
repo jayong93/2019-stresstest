@@ -30,6 +30,7 @@ static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
 const DELAY_THRESHOLD: usize = 1000;
 
+#[derive(Debug)]
 struct Player {
     id: i32,
     position: AtomicU32,
