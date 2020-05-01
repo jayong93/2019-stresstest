@@ -398,6 +398,7 @@ async fn main() -> GameResult {
         let mut is_increasing = true;
         let accept_delay = 50;
         let mut client_to_disconnect = 0;
+        let mut max_player_num = unsafe { MAX_TEST };
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -409,9 +410,7 @@ async fn main() -> GameResult {
             let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
             if DELAY_THRESHOLD_2 < g_delay {
                 if is_increasing {
-                    unsafe {
-                        MAX_TEST = cur_player_num;
-                    }
+                    max_player_num = cur_player_num;
                     is_increasing = false;
                 }
                 if cur_player_num < 100 {
@@ -430,10 +429,8 @@ async fn main() -> GameResult {
                 continue;
             }
 
-            unsafe {
-                if MAX_TEST - (MAX_TEST / 20) < cur_player_num {
-                    continue;
-                }
+            if max_player_num - (max_player_num / 20) < cur_player_num {
+                continue;
             }
 
             is_increasing = true;
