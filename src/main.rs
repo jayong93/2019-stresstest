@@ -341,6 +341,7 @@ fn disconnect_client(client_id: i32, write_handle: &mut PlayerMapWrite) {
             .next()
             .expect("Can't disconnect client, because can't find player");
         player.is_alive.store(false, Ordering::Relaxed);
+        PLAYER_NUM.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
