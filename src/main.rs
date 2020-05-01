@@ -417,7 +417,7 @@ async fn main() -> GameResult {
                 if cur_player_num < 100 {
                     continue;
                 }
-                if elapsed_time < (accept_delay * 10) as u128 {
+                if elapsed_time < (accept_delay * 2) as u128 {
                     continue;
                 }
 
