@@ -124,8 +124,8 @@ async fn process_login(
             write_handle.refresh();
             Some(player)
         }
-        _ => {
-            eprintln!("the server has sent a packet that isn't a login packet");
+        p @ _ => {
+            eprintln!("the server has sent a packet that isn't a login packet.\nIt was:\n{:#?}", p);
             None
         }
     }
@@ -240,7 +240,10 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
             std::mem::size_of::<packet::CSTeleport>(),
         )
     };
-    stream.write_all(p_bytes).await.expect("Can't send teleport packet");
+    stream
+        .write_all(p_bytes)
+        .await
+        .expect("Can't send teleport packet");
 
     let mut packets = [
         packet::CSMove::new(packet::Direction::Up, 0),
@@ -325,7 +328,10 @@ impl EventHandler for GameState {
 
 fn disconnect_client(client_id: i32, write_handle: &mut PlayerMapWrite) {
     if let Some(values) = write_handle.get(&client_id) {
-        let player = values.iter().next().expect("Can't disconnect client, because can't find player");
+        let player = values
+            .iter()
+            .next()
+            .expect("Can't disconnect client, because can't find player");
         player.is_alive.store(false, Ordering::Relaxed);
     }
 }
@@ -436,18 +442,23 @@ async fn main() -> GameResult {
                             std::mem::size_of::<packet::CSLogin>(),
                         )
                     };
-                    client.write_all(p_bytes).await.expect("Can't send login packet");
+                    client
+                        .write_all(p_bytes)
+                        .await
+                        .expect("Can't send login packet");
 
-                    let player = process_login(&mut client, &mut write_handle).await.expect("Can't receive login ok packet");
-
-                    handle = Some(task::spawn(async move {
-                        let client = Arc::new(client);
-                        let recv = task::spawn(receiver(client.clone(), player.clone()));
-                        let send = task::spawn(sender(client, player));
-                        PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
-                        recv.await;
-                        send.await;
-                    }));
+                    if let Some(player) = process_login(&mut client, &mut write_handle).await {
+                        handle = Some(task::spawn(async move {
+                            let client = Arc::new(client);
+                            let recv = task::spawn(receiver(client.clone(), player.clone()));
+                            let send = task::spawn(sender(client, player));
+                            PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
+                            recv.await;
+                            send.await;
+                        }));
+                    } else {
+                        continue;
+                    }
                 }
                 Err(e) => eprintln!("Can't connect to server: {}", e),
             }
