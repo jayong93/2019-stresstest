@@ -58,7 +58,7 @@ pub struct SCPosPlayer {
     pub id: i32,
     pub x: i16,
     pub y: i16,
-    pub seq_no: i32,
+    pub move_time: u32,
 }
 #[repr(C, packed(1))]
 pub struct SCLoginOk {
@@ -74,7 +74,7 @@ pub struct SCLoginOk {
 pub struct CSMove {
     pub header: PacketHeader,
     pub direction: i8,
-    pub seq_no: i32,
+    pub move_time: u32,
 }
 #[repr(C, packed(1))]
 pub struct CSLogin {
@@ -95,14 +95,14 @@ pub enum Direction {
 }
 
 impl CSMove {
-    pub fn new(direction: Direction, seq_no: i32) -> Self {
+    pub fn new(direction: Direction, move_time: u32) -> Self {
         Self {
             header: PacketHeader {
                 size: size_of::<Self>() as i8,
                 p_type: CSPacketType::Move as i8,
             },
             direction: direction as i8,
-            seq_no,
+            move_time,
         }
     }
 }

@@ -12,14 +12,15 @@ use rand::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use structopt::StructOpt;
 
 mod packet;
 
 type PlayerMapRead = ReadHandle<i32, Arc<Player>, (), RandomState>;
+type PlayerMapWrite = WriteHandle<i32, Arc<Player>, (), RandomState>;
 
 static mut MAX_TEST: u64 = 0;
 static mut WINDOW_SIZE: (usize, usize) = (0, 0);
@@ -28,29 +29,21 @@ static mut CELL_SIZE: f32 = 0.0;
 static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
-const DELAY_THRESHOLD: usize = 1000;
+const DELAY_THRESHOLD: usize = 100;
+const DELAY_THRESHOLD_2: usize = 150;
 
 #[derive(Debug)]
 struct Player {
     id: i32,
     position: AtomicU32,
-    seq_no: AtomicI32,
-    last_move_ptr: AtomicPtr<Instant>,
-    last_move_time: UnsafeCell<Option<Box<Instant>>>,
-    last_delay: AtomicUsize,
     recv_buf: UnsafeCell<Vec<u8>>,
     packet_buf: UnsafeCell<Vec<u8>>,
+    is_alive: AtomicBool,
 }
 
 // recv_buf, packet_buf, last_move_time은 receiver에서만 접근.
 // receiver는 한번에 한 thread만 호출할 수 있으므로 안전.
 unsafe impl Sync for Player {}
-
-impl Drop for Player {
-    fn drop(&mut self) {
-        unsafe { Box::from_raw(self.last_move_ptr.load(Ordering::Relaxed)) };
-    }
-}
 
 impl PartialEq for Player {
     fn eq(&self, other: &Self) -> bool {
@@ -70,16 +63,12 @@ const RECV_SIZE: usize = 1024;
 
 impl Player {
     fn new(id: i32, x: i16, y: i16) -> Self {
-        let now = Instant::now();
         Player {
             id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
-            seq_no: AtomicI32::new(0),
-            last_move_ptr: AtomicPtr::new(Box::into_raw(Box::new(now))),
-            last_move_time: UnsafeCell::new(Some(Box::new(now))),
-            last_delay: AtomicUsize::new(0),
             packet_buf: UnsafeCell::new(Vec::with_capacity(RECV_SIZE * 2)),
             recv_buf: UnsafeCell::new(vec![0; RECV_SIZE]),
+            is_alive: AtomicBool::new(true),
         }
     }
     fn compose_position(x: i16, y: i16) -> u32 {
@@ -95,37 +84,6 @@ impl Player {
     fn set_pos(&self, x: i16, y: i16) {
         let new_pos = Self::compose_position(x, y);
         self.position.store(new_pos, Ordering::SeqCst);
-    }
-
-    fn change_move_time(&self, new_time: Option<Box<Instant>>) -> Option<Box<Instant>> {
-        let new_ptr = if let Some(p) = new_time {
-            Box::into_raw(p)
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let mut old_ptr = self.last_move_ptr.load(Ordering::Relaxed);
-        while let Err(ptr) = self.last_move_ptr.compare_exchange(
-            old_ptr,
-            new_ptr,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
-            old_ptr = ptr;
-        }
-
-        if old_ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { Box::from_raw(old_ptr) })
-        }
-    }
-
-    unsafe fn recv_move_time(&self) -> Instant {
-        let mut_time = &mut *self.last_move_time.get();
-        let old_time = std::mem::take(mut_time);
-        *mut_time = self.change_move_time(old_time);
-        **(mut_time.as_ref().unwrap())
     }
 }
 
@@ -209,7 +167,7 @@ fn assemble_packet(player: Arc<Player>, mut received_size: usize) -> Arc<Player>
 }
 
 fn process_packet(packet: &[u8], player: &Arc<Player>) {
-    use packet::*;
+    use packet::{SCPacketType, SCPosPlayer};
     match SCPacketType::from(packet[1] as usize) {
         SCPacketType::Pos => {
             let p = from_bytes::<SCPosPlayer>(packet);
@@ -217,20 +175,14 @@ fn process_packet(packet: &[u8], player: &Arc<Player>) {
 
             if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
-                if p.seq_no > 10 {
-                    let last_time = unsafe { player.recv_move_time() };
-                    let mut d_ms = last_time.elapsed().as_millis();
-                    if p.seq_no != player.seq_no.load(Ordering::Relaxed) {
-                        d_ms = std::cmp::max(DELAY_THRESHOLD as u128, d_ms);
-                    }
-                    player.last_delay.store(d_ms as usize, Ordering::Relaxed);
-                    let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                    if (g_delay as u128) < d_ms {
+                if p.move_time != 0 {
+                    let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
+                    let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+                    if global_delay < d_ms as usize {
                         GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                    } else if (g_delay as u128) > d_ms {
-                        let g_delay = GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed);
-                        if g_delay == 0 {
-                            GLOBAL_DELAY.store(0, Ordering::Relaxed);
+                    } else if global_delay > d_ms as usize {
+                        if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
+                            GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -268,7 +220,7 @@ async fn read_packet(
 
 async fn receiver(stream: Arc<net::TcpStream>, mut player: Arc<Player>) {
     let mut stream = BufReader::new(&*stream);
-    loop {
+    while player.is_alive.load(Ordering::Relaxed) {
         if let Ok(p) = read_packet(&mut stream, player).await {
             player = p
         } else {
@@ -290,8 +242,6 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
     };
     stream.write_all(p_bytes).await.unwrap();
 
-    let mut move_time: Option<Box<Instant>> = Some(Box::new(Instant::now()));
-
     let mut packets = [
         packet::CSMove::new(packet::Direction::Up, 0),
         packet::CSMove::new(packet::Direction::Down, 0),
@@ -299,10 +249,9 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
         packet::CSMove::new(packet::Direction::Right, 0),
     ];
     let mut rng = StdRng::from_entropy();
-    loop {
-        let seq_no = player.seq_no.fetch_add(1, Ordering::Relaxed) + 1;
+    while player.is_alive.load(Ordering::Relaxed) {
         let picked_packet = &mut packets[rng.gen_range(0, packets.len())];
-        picked_packet.seq_no = seq_no;
+        picked_packet.move_time = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32;
 
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -310,8 +259,6 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        **(move_time.as_mut().unwrap()) = Instant::now();
-        move_time = player.change_move_time(move_time);
         if stream.write_all(bytes).await.is_err() {
             eprintln!("Can't send to the server");
             return;
@@ -339,13 +286,14 @@ impl EventHandler for GameState {
         let mut mesh_builder = graphics::MeshBuilder::new();
         let d_mode = graphics::DrawMode::fill();
         let can_render;
-        let mut delay_sum = 0;
-        let mut player_num = 0usize;
         {
             can_render = !self.player_read_handle.is_empty();
 
             for (_, players) in self.player_read_handle.read().iter() {
                 if let Some(player) = players.iter().next() {
+                    if !player.is_alive.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let (x, y) = player.get_pos();
                     unsafe {
                         let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
@@ -356,9 +304,6 @@ impl EventHandler for GameState {
                             [1.0, 1.0, 1.0, 1.0].into(),
                         );
                     }
-
-                    delay_sum += player.last_delay.load(Ordering::Relaxed);
-                    player_num += 1;
                 }
             }
         }
@@ -368,14 +313,20 @@ impl EventHandler for GameState {
                 .draw(ctx, graphics::DrawParam::new())?;
 
             let delay_s = format!(
-                "Delay: {} ms\nAverage Delay: {} ms\nPlayer: {}",
+                "Delay: {} ms\nPlayer: {}",
                 GLOBAL_DELAY.load(Ordering::Relaxed),
-                delay_sum / player_num,
                 PLAYER_NUM.load(Ordering::Relaxed)
             );
             graphics::Text::new(delay_s).draw(ctx, graphics::DrawParam::new())?;
         }
         graphics::present(ctx)
+    }
+}
+
+fn disconnect_client(client_id: i32, write_handle: &mut PlayerMapWrite) {
+    if let Some(values) = write_handle.get(&client_id) {
+        let player = values.iter().next().unwrap();
+        player.is_alive.store(false, Ordering::Relaxed);
     }
 }
 
@@ -419,7 +370,6 @@ async fn main() -> GameResult {
     let (read_handle, mut write_handle) = Options::default()
         .with_capacity(unsafe { MAX_TEST } as usize)
         .construct();
-    let read_handle_clone = read_handle.clone();
 
     let server = async move {
         let mut handle = None;
@@ -429,24 +379,54 @@ async fn main() -> GameResult {
             });
         ip_addr.set_port(unsafe { PORT });
 
-        let mut rng = StdRng::from_entropy();
         let mut last_login_time = Instant::now();
+        let mut delay_multiplier = 1;
+        let mut is_increasing = true;
+        let accept_delay = 50;
+        let mut client_to_disconnect = 0;
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
-            let mut delay = 50;
-            let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed) as u64;
+            // 접속 가능 여부 판단
+            let elapsed_time = last_login_time.elapsed().as_millis();
+            if elapsed_time < (accept_delay as u128 * delay_multiplier) {
+                continue;
+            }
 
-            if g_delay < DELAY_THRESHOLD as u64 {
-                if g_delay > 50 {
-                    delay = rng.gen_range(50, g_delay);
+            let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+            let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
+            if DELAY_THRESHOLD_2 < g_delay {
+                if is_increasing {
+                    unsafe {
+                        MAX_TEST = cur_player_num;
+                    }
+                    is_increasing = false;
                 }
-
-                if last_login_time.elapsed().as_millis() < delay as u128 {
-                    task::yield_now().await;
+                if cur_player_num < 100 {
                     continue;
                 }
-                last_login_time += Duration::from_millis(delay);
+                if elapsed_time < (accept_delay * 10) as u128 {
+                    continue;
+                }
 
-                if let Ok(mut client) = net::TcpStream::connect(ip_addr).await {
+                last_login_time = Instant::now();
+                disconnect_client(client_to_disconnect, &mut write_handle);
+                client_to_disconnect += 1;
+                continue;
+            } else if DELAY_THRESHOLD < g_delay {
+                delay_multiplier = 10;
+                continue;
+            }
+
+            unsafe {
+                if MAX_TEST - (MAX_TEST / 20) < cur_player_num {
+                    continue;
+                }
+            }
+
+            is_increasing = true;
+            last_login_time = Instant::now();
+
+            match net::TcpStream::connect(ip_addr).await {
+                Ok(mut client) => {
                     client.set_nodelay(true).ok();
 
                     let login_packet = packet::CSLogin::new();
@@ -469,7 +449,9 @@ async fn main() -> GameResult {
                         send.await;
                     }));
                 }
+                Err(e) => eprintln!("Can't connect to server: {}", e),
             }
+            // 접속 시도
         }
         handle.unwrap().await;
     };
@@ -484,7 +466,7 @@ async fn main() -> GameResult {
             .window_mode(win_mode);
         let (mut ctx, mut event_loop) = cb.build()?;
         let mut game_state = GameState {
-            player_read_handle: read_handle_clone,
+            player_read_handle: read_handle,
         };
         event::run(&mut ctx, &mut event_loop, &mut game_state)
     })
