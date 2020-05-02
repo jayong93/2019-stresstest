@@ -2,26 +2,36 @@ use async_std::{
     io::{prelude::*, BufReader},
     net, task,
 };
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use evmap::{self, Options, ReadHandle, WriteHandle};
-use ggez::conf::{WindowMode, WindowSetup};
-use ggez::event::{self, EventHandler};
-use ggez::graphics;
-use ggez::graphics::Drawable;
-use ggez::{Context, ContextBuilder, GameResult};
 use num::FromPrimitive;
 use rand::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
+use std::io::{stdout, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc::channel, Arc};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use structopt::StructOpt;
+use tui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::Color,
+    widgets::{
+        canvas::{Canvas, Points},
+        Block, Borders, Paragraph, Text,
+    },
+    Terminal,
+};
 
 mod packet;
 
 type PlayerMapRead = ReadHandle<i32, Arc<Player>, (), RandomState>;
-type PlayerMapWrite = WriteHandle<i32, Arc<Player>, (), RandomState>;
 
 static mut MAX_TEST: u64 = 0;
 static mut WINDOW_SIZE: (usize, usize) = (0, 0);
@@ -281,64 +291,8 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
     }
 }
 
-struct GameState {
-    player_read_handle: PlayerMapRead,
-}
-
-impl EventHandler for GameState {
-    fn update(&mut self, ctx: &mut Context) -> GameResult {
-        let delta = ggez::timer::delta(ctx).as_secs_f32();
-        let target = 1.0 / 30.0;
-        if delta <= 1.0 / 30.0 {
-            ggez::timer::sleep(std::time::Duration::from_secs_f32(target - delta));
-        }
-        Ok(())
-    }
-
-    fn draw(&mut self, ctx: &mut Context) -> GameResult {
-        graphics::clear(ctx, [0.0, 0.0, 0.0, 1.0].into());
-        let mut mesh_builder = graphics::MeshBuilder::new();
-        let d_mode = graphics::DrawMode::fill();
-        let can_render;
-        {
-            can_render = !self.player_read_handle.is_empty();
-
-            for (_, players) in self.player_read_handle.read().iter() {
-                if let Some(player) = players.iter().next() {
-                    if !player.is_alive.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let (x, y) = player.get_pos();
-                    unsafe {
-                        let cell_x: f32 = x as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                        let cell_y: f32 = y as f32 * CELL_SIZE + (CELL_SIZE / 4.0);
-                        mesh_builder.rectangle(
-                            d_mode,
-                            [cell_x, cell_y, CELL_SIZE / 2.0, CELL_SIZE / 2.0].into(),
-                            [1.0, 1.0, 1.0, 1.0].into(),
-                        );
-                    }
-                }
-            }
-        }
-        if can_render {
-            mesh_builder
-                .build(ctx)?
-                .draw(ctx, graphics::DrawParam::new())?;
-
-            let delay_s = format!(
-                "Delay: {} ms\nPlayer: {}",
-                GLOBAL_DELAY.load(Ordering::Relaxed),
-                PLAYER_NUM.load(Ordering::Relaxed)
-            );
-            graphics::Text::new(delay_s).draw(ctx, graphics::DrawParam::new())?;
-        }
-        graphics::present(ctx)
-    }
-}
-
-fn disconnect_client(client_id: i32, write_handle: &mut PlayerMapWrite) {
-    if let Some(values) = write_handle.get(&client_id) {
+fn disconnect_client(client_id: i32, read_handle: &PlayerMapRead) {
+    if let Some(values) = read_handle.get(&client_id) {
         let player = values
             .iter()
             .next()
@@ -366,8 +320,13 @@ struct CmdOption {
     ip_addr: String,
 }
 
+enum Event<I> {
+    Key(I),
+    Tick,
+}
+
 #[async_std::main]
-async fn main() -> GameResult {
+async fn main() {
     let opt = CmdOption::from_args();
     unsafe {
         MAX_TEST = opt.max_player as u64;
@@ -477,18 +436,113 @@ async fn main() -> GameResult {
     };
     task::spawn(server);
 
-    task::spawn_blocking(|| {
-        let setup = WindowSetup::default().title("Stress Test");
-        let win_mode =
-            unsafe { WindowMode::default().dimensions(WINDOW_SIZE.0 as f32, WINDOW_SIZE.1 as f32) };
-        let cb = ContextBuilder::new("PL-StressTest", "CJY")
-            .window_setup(setup)
-            .window_mode(win_mode);
-        let (mut ctx, mut event_loop) = cb.build()?;
-        let mut game_state = GameState {
-            player_read_handle: read_handle,
-        };
-        event::run(&mut ctx, &mut event_loop, &mut game_state)
-    })
-    .await
+    let tick_rate = Duration::from_millis(16);
+
+    let (tx, rx) = channel();
+
+    task::spawn_blocking(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            if event::poll(tick_rate - last_tick.elapsed()).expect("Can't poll event") {
+                if let CEvent::Key(key) = event::read().expect("Can't read event") {
+                    tx.send(Event::Key(key)).expect("Can't send event message");
+                }
+            }
+            if last_tick.elapsed() >= tick_rate {
+                tx.send(Event::Tick).expect("Can't send event message");
+                last_tick = Instant::now();
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    {
+        let read_handle = read_handle.clone();
+        task::spawn_blocking(move || {
+            enable_raw_mode().expect("Can't use raw mode");
+            let mut stdout = stdout();
+            execute!(stdout, EnterAlternateScreen).expect("Can't enter to alternate screen");
+            let backend = CrosstermBackend::new(stdout);
+            let mut terminal = Terminal::new(backend).expect("Can't create a terminal");
+            terminal.hide_cursor().expect("Can't hide a cursor");
+
+            while let Ok(e) = rx.recv() {
+                match e {
+                    Event::Tick => {
+                        let pos_vec: Vec<_> = read_handle
+                            .read()
+                            .iter()
+                            .filter_map(|(_, players)| {
+                                if let Some(player) = players.iter().next() {
+                                    if !player.is_alive.load(Ordering::Relaxed) {
+                                        return None;
+                                    }
+                                    let (x, y) = player.get_pos();
+                                    Some((x as f64, y as f64))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        terminal
+                            .draw(|mut f| {
+                                let layout = Layout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints(
+                                        [Constraint::Percentage(10), Constraint::Percentage(90)]
+                                            .as_ref(),
+                                    )
+                                    .split(f.size());
+                                let text = [
+                                    Text::Raw(
+                                        format!(
+                                            "Delay: {} ms, ",
+                                            GLOBAL_DELAY.load(Ordering::Relaxed)
+                                        )
+                                        .into(),
+                                    ),
+                                    Text::Raw(
+                                        format!(
+                                            "Players: {}\n",
+                                            PLAYER_NUM.load(Ordering::Relaxed)
+                                        )
+                                        .into(),
+                                    ),
+                                ];
+                                let para = Paragraph::new(text.iter())
+                                    .block(Block::default().borders(Borders::ALL).title("Info"))
+                                    .wrap(true);
+                                f.render_widget(para, layout[0]);
+                                let canvas = Canvas::default()
+                                    .block(Block::default().borders(Borders::ALL).title("World"))
+                                    .paint(|ctx| {
+                                        let points = Points {
+                                            coords: pos_vec.as_slice(),
+                                            color: Color::White,
+                                        };
+                                        ctx.draw(&points);
+                                    })
+                                    .x_bounds([0.0, unsafe { BOARD_SIZE as f64 }])
+                                    .y_bounds([0.0, unsafe { BOARD_SIZE as f64 }]);
+                                f.render_widget(canvas, layout[1]);
+                            })
+                            .expect("Can't draw to screen");
+                    }
+                    Event::Key(key_event) if key_event.code == KeyCode::Char('q') => {
+                        disable_raw_mode().expect("Can't disable raw mode");
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                            .expect("Can't leave alternate screen");
+                        terminal.show_cursor().expect("Can't show cursor");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+    }
+
+    for (id, _) in read_handle.read().iter() {
+        disconnect_client(*id, &read_handle);
+    }
 }

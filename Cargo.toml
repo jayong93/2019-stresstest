@@ -10,9 +10,10 @@ edition = "2018"
 async-std = {version="1.5.0", features=["unstable", "attributes"]}
 rand = "0.7.2"
 lazy_static = "1.4.0"
-ggez = "*"
 structopt = "0.3.2"
 evmap = "9.0.0"
 num = "*"
 num-derive = "*"
 num-traits = "*"
+tui = {version="0.9.1", default-features = false, features=["crossterm"]}
+crossterm = "0.17.3"
