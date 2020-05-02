@@ -446,12 +446,17 @@ async fn main() {
     task::spawn_blocking(move || {
         let mut last_tick = Instant::now();
         loop {
-            if event::poll(tick_rate - last_tick.elapsed()).expect("Can't poll event") {
-                if let CEvent::Key(key) = event::read().expect("Can't read event") {
-                    tx.send(Event::Key(key)).expect("Can't send event message");
+            if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
+                if event::poll(d_time).expect("Can't poll event") {
+                    if let CEvent::Key(key) = event::read().expect("Can't read event") {
+                        tx.send(Event::Key(key)).expect("Can't send event message");
+                    }
                 }
-            }
-            if last_tick.elapsed() >= tick_rate {
+                if last_tick.elapsed() > tick_rate {
+                    tx.send(Event::Tick).expect("Can't send event message");
+                    last_tick = Instant::now();
+                }
+            } else {
                 tx.send(Event::Tick).expect("Can't send event message");
                 last_tick = Instant::now();
             }
