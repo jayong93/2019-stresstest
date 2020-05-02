@@ -3,7 +3,7 @@ use async_std::{
     net, task,
 };
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode},
+    event::{self, Event as CEvent, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -531,7 +531,11 @@ async fn main() {
                             })
                             .expect("Can't draw to screen");
                     }
-                    Event::Key(key_event) if key_event.code == KeyCode::Char('q') => {
+                    Event::Key(key_event)
+                        if key_event.code == KeyCode::Char('q')
+                            || (key_event.modifiers == KeyModifiers::CONTROL
+                                && key_event.code == KeyCode::Char('c')) =>
+                    {
                         disable_raw_mode().expect("Can't disable raw mode");
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)
                             .expect("Can't leave alternate screen");
