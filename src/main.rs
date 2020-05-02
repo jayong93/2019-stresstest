@@ -392,7 +392,9 @@ async fn main() {
                 continue;
             }
 
-            if max_player_num - (max_player_num / 20) < cur_player_num {
+            if max_player_num != unsafe { MAX_TEST }
+                && max_player_num - (max_player_num / 20) < cur_player_num
+            {
                 continue;
             }
 
@@ -420,11 +422,12 @@ async fn main() {
                             let client = Arc::new(client);
                             let recv = task::spawn(receiver(client.clone(), player.clone()));
                             let send = task::spawn(sender(client, player));
-                            PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                             recv.await;
                             send.await;
                         }));
+                        PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                     } else {
+                        eprintln!("Can't process login");
                         continue;
                     }
                 }
