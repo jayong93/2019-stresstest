@@ -17,7 +17,6 @@ pub enum SCPacketType {
     Put,
     Remove,
     Chat,
-    Unknown,
 }
 
 #[repr(C)]

@@ -139,36 +139,44 @@ async fn process_login(
     }
 }
 
-fn assemble_packet(player: Arc<Player>, mut received_size: usize) -> Arc<Player> {
+fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
+    let recv_buf;
+    let prev_buf;
     unsafe {
-        let recv_buf = &mut *player.recv_buf.get();
-        let prev_buf = &mut *player.packet_buf.get();
-        let mut packet = [0u8; 256];
-        let mut recv_buf = &mut recv_buf[..];
+        recv_buf = &mut *player.recv_buf.get();
+        prev_buf = &mut *player.packet_buf.get();
+    }
+    let mut packet = [0u8; 256];
+    let mut recv_buf = &mut recv_buf[..received_size];
 
-        while received_size > 0 {
-            let prev_len = prev_buf.len();
-            let packet_size = if prev_len > 0 {
-                prev_buf[0]
-            } else {
-                recv_buf[0]
-            } as usize;
+    while recv_buf.len() > 0 {
+        let prev_len = prev_buf.len();
+        let packet_size = if prev_len > 0 {
+            prev_buf[0]
+        } else {
+            recv_buf[0]
+        } as usize;
 
-            if prev_len + received_size >= packet_size {
-                let copied_size = packet_size - prev_len;
-                packet[..prev_len].copy_from_slice(prev_buf);
-                packet[prev_len..packet_size].copy_from_slice(&recv_buf[..copied_size]);
-                recv_buf = &mut recv_buf[copied_size..];
-                prev_buf.clear();
-                received_size -= copied_size;
+        if packet_size == 0 {
+            eprintln!("a packet size was 0");
+            return player;
+        }
 
-                process_packet(&packet[..packet_size], &player);
-            } else {
-                prev_buf.reserve(prev_len + received_size);
-                prev_buf.set_len(prev_len + received_size);
-                prev_buf[prev_len..].copy_from_slice(&recv_buf[..received_size]);
-                break;
+        if prev_len + recv_buf.len() >= packet_size {
+            let copied_size = packet_size - prev_len;
+            packet[..prev_len].copy_from_slice(prev_buf);
+            packet[prev_len..packet_size].copy_from_slice(&recv_buf[..copied_size]);
+            recv_buf = &mut recv_buf[copied_size..];
+            prev_buf.clear();
+
+            process_packet(&packet[..packet_size], &player);
+        } else {
+            prev_buf.reserve(prev_len + recv_buf.len());
+            unsafe {
+                prev_buf.set_len(prev_len + recv_buf.len());
             }
+            prev_buf[prev_len..].copy_from_slice(&recv_buf);
+            break;
         }
     }
     player
@@ -215,11 +223,6 @@ async fn read_packet(
         .map_err(|e| eprintln!("{}", e))?;
     if read_size == 0 {
         eprintln!("Read zero byte");
-        return Err(());
-    }
-    let total_size = read_buf[0] as usize;
-    if total_size <= 0 {
-        eprintln!("a packet has 0 size");
         return Err(());
     }
 
