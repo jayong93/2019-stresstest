@@ -48,7 +48,7 @@ struct Player {
     id: i32,
     position: AtomicU32,
     recv_buf: UnsafeCell<Vec<u8>>,
-    packet_buf: UnsafeCell<Vec<u8>>,
+    prev_packet_size: UnsafeCell<u64>,
     is_alive: AtomicBool,
 }
 
@@ -77,7 +77,7 @@ impl Player {
         Player {
             id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
-            packet_buf: UnsafeCell::new(Vec::with_capacity(RECV_SIZE * 2)),
+            prev_packet_size: UnsafeCell::new(0),
             recv_buf: UnsafeCell::new(vec![0; RECV_SIZE]),
             is_alive: AtomicBool::new(true),
         }
@@ -151,41 +151,33 @@ async fn process_login(
 
 fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
     let recv_buf;
-    let prev_buf;
+    let prev_size;
     unsafe {
         recv_buf = &mut *player.recv_buf.get();
-        prev_buf = &mut *player.packet_buf.get();
+        prev_size = &mut *player.prev_packet_size.get();
     }
-    let mut packet = [0u8; 256];
     let mut recv_buf = &mut recv_buf[..received_size];
 
     while recv_buf.len() > 0 {
-        let prev_len = prev_buf.len();
-        let packet_size = if prev_len > 0 {
-            prev_buf[0]
-        } else {
-            recv_buf[0]
-        } as usize;
+        let packet_size = recv_buf[0] as usize;
 
         if packet_size == 0 {
             eprintln!("a packet size was 0");
             return player;
         }
 
-        if prev_len + recv_buf.len() >= packet_size {
-            let copied_size = packet_size - prev_len;
-            packet[..prev_len].copy_from_slice(prev_buf);
-            packet[prev_len..packet_size].copy_from_slice(&recv_buf[..copied_size]);
-            recv_buf = &mut recv_buf[copied_size..];
-            prev_buf.clear();
-
-            process_packet(&packet[..packet_size], &player);
+        let required = packet_size - *prev_size as usize;
+        if required <= recv_buf.len() {
+            process_packet(&recv_buf[..packet_size], &player);
+            recv_buf = &mut recv_buf[packet_size..];
+            *prev_size = 0;
         } else {
-            prev_buf.reserve(prev_len + recv_buf.len());
             unsafe {
-                prev_buf.set_len(prev_len + recv_buf.len());
+                (*player.recv_buf.get())
+                    .as_mut_ptr()
+                    .copy_from(recv_buf.as_ptr(), recv_buf.len());
             }
-            prev_buf[prev_len..].copy_from_slice(&recv_buf);
+            *prev_size = recv_buf.len() as u64;
             break;
         }
     }
@@ -225,10 +217,12 @@ async fn read_packet(
     let read_buf;
     {
         let read_ptr = player.recv_buf.get();
-        read_buf = unsafe { &mut *read_ptr };
+        read_buf = unsafe {
+            &mut ((&mut *read_ptr).as_mut_slice())[*player.prev_packet_size.get() as usize..]
+        };
     }
     let read_size = stream
-        .read(read_buf.as_mut_slice())
+        .read(read_buf)
         .await
         .map_err(|e| eprintln!("{}", e))?;
     if read_size == 0 {
