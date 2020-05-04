@@ -48,7 +48,7 @@ struct Player {
     id: i32,
     position: AtomicU32,
     recv_buf: UnsafeCell<Vec<u8>>,
-    prev_packet_size: UnsafeCell<u64>,
+    prev_packet_size: UnsafeCell<usize>,
     is_alive: AtomicBool,
 }
 
@@ -156,10 +156,11 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
         recv_buf = &mut *player.recv_buf.get();
         prev_size = &mut *player.prev_packet_size.get();
     }
-    let mut recv_buf = &mut recv_buf[..received_size];
+    let recv_buf = &mut recv_buf[..received_size];
+    let mut packet_head_idx = 0;
 
-    while recv_buf.len() > 0 {
-        let packet_size = recv_buf[0] as usize;
+    while packet_head_idx < received_size {
+        let packet_size = recv_buf[packet_head_idx] as usize;
 
         if packet_size < 2 {
             eprintln!("a packet size was less than 2");
@@ -167,21 +168,20 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
             return player;
         }
 
-        let required = packet_size - *prev_size as usize;
-        if required <= recv_buf.len() {
-            process_packet(&recv_buf[..packet_size], &player);
-            recv_buf = &mut recv_buf[packet_size..];
-            *prev_size = 0;
+        let packet_tail_idx = packet_head_idx + packet_size;
+        if packet_tail_idx <= received_size {
+            process_packet(
+                &recv_buf[packet_head_idx..packet_tail_idx],
+                &player,
+            );
+            packet_head_idx = packet_tail_idx;
         } else {
-            unsafe {
-                (*player.recv_buf.get())
-                    .as_mut_ptr()
-                    .copy_from(recv_buf.as_ptr(), recv_buf.len());
-            }
-            *prev_size = recv_buf.len() as u64;
+            recv_buf.copy_within(packet_head_idx.., 0);
             break;
         }
     }
+
+    *prev_size = received_size - packet_head_idx;
     player
 }
 
@@ -216,14 +216,16 @@ async fn read_packet(
     player: Arc<Player>,
 ) -> Result<Arc<Player>, ()> {
     let read_buf;
+    let prev_packet_size;
     {
         let read_ptr = player.recv_buf.get();
-        read_buf = unsafe {
-            &mut ((&mut *read_ptr).as_mut_slice())[*player.prev_packet_size.get() as usize..]
-        };
+        unsafe {
+            read_buf = (&mut *read_ptr).as_mut_slice();
+            prev_packet_size = *player.prev_packet_size.get() as usize;
+        }
     }
     let read_size = stream
-        .read(read_buf)
+        .read(&mut read_buf[prev_packet_size..])
         .await
         .map_err(|e| eprintln!("{}", e))?;
     if read_size == 0 {
