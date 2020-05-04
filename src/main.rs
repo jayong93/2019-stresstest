@@ -161,8 +161,9 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
     while recv_buf.len() > 0 {
         let packet_size = recv_buf[0] as usize;
 
-        if packet_size == 0 {
-            eprintln!("a packet size was 0");
+        if packet_size < 2 {
+            eprintln!("a packet size was less than 2");
+            *prev_size = 0;
             return player;
         }
 
