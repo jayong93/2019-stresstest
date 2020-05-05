@@ -10,7 +10,6 @@ use crossterm::{
 use evmap::{self, Options, ReadHandle, WriteHandle};
 use num::FromPrimitive;
 use rand::prelude::*;
-use std::cell::UnsafeCell;
 use std::collections::hash_map::RandomState;
 use std::io::{stdout, Write};
 use std::str::FromStr;
@@ -47,8 +46,6 @@ const DELAY_THRESHOLD_2: usize = 150;
 struct Player {
     id: i32,
     position: AtomicU32,
-    recv_buf: UnsafeCell<Vec<u8>>,
-    prev_packet_size: UnsafeCell<usize>,
     is_alive: AtomicBool,
 }
 
@@ -77,8 +74,6 @@ impl Player {
         Player {
             id: id,
             position: AtomicU32::new(Self::compose_position(x, y)),
-            prev_packet_size: UnsafeCell::new(0),
-            recv_buf: UnsafeCell::new(vec![0; RECV_SIZE]),
             is_alive: AtomicBool::new(true),
         }
     }
@@ -149,14 +144,13 @@ async fn process_login(
     }
 }
 
-fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
-    let recv_buf: &mut [u8];
-    let prev_size: &mut usize;
-    unsafe {
-        recv_buf = &mut *player.recv_buf.get();
-        prev_size = &mut *player.prev_packet_size.get();
-    }
-    let recv_buf = &mut recv_buf[..(*prev_size + received_size)];
+async fn assemble_packet(
+    player: Arc<Player>,
+    buf: &mut [u8],
+    prev_packet_size: &mut usize,
+    received_size: usize,
+) -> Arc<Player> {
+    let recv_buf = &mut buf[..(*prev_packet_size + received_size)];
     let mut packet_head_idx = 0;
 
     while packet_head_idx < recv_buf.len() {
@@ -164,7 +158,7 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
 
         if packet_size < 2 {
             eprintln!("a packet size was less than 2");
-            *prev_size = 0;
+            *prev_packet_size = 0;
             return player;
         }
 
@@ -172,10 +166,10 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
         if packet_tail_idx <= recv_buf.len() {
             process_packet(&recv_buf[packet_head_idx..packet_tail_idx], &player);
             packet_head_idx = packet_tail_idx;
-            *prev_size = 0;
+            *prev_packet_size = 0;
         } else {
             recv_buf.copy_within(packet_head_idx.., 0);
-            *prev_size = recv_buf.len() - packet_head_idx;
+            *prev_packet_size = recv_buf.len() - packet_head_idx;
             break;
         }
     }
@@ -212,18 +206,11 @@ fn process_packet(packet: &[u8], player: &Arc<Player>) {
 async fn read_packet(
     stream: &mut BufReader<&net::TcpStream>,
     player: Arc<Player>,
+    buf: &mut [u8],
+    prev_packet_size: &mut usize,
 ) -> Result<Arc<Player>, ()> {
-    let read_buf;
-    let prev_packet_size;
-    {
-        let read_ptr = player.recv_buf.get();
-        unsafe {
-            read_buf = (&mut *read_ptr).as_mut_slice();
-            prev_packet_size = *player.prev_packet_size.get() as usize;
-        }
-    }
     let read_size = stream
-        .read(&mut read_buf[prev_packet_size..])
+        .read(&mut buf[*prev_packet_size..])
         .await
         .map_err(|e| eprintln!("{}", e))?;
     if read_size == 0 {
@@ -231,13 +218,18 @@ async fn read_packet(
         return Err(());
     }
 
-    Ok(task::spawn_blocking(move || assemble_packet(player, read_size)).await)
+    Ok(assemble_packet(player, buf, prev_packet_size, read_size).await)
 }
 
 async fn receiver(stream: Arc<net::TcpStream>, mut player: Arc<Player>) {
     let mut stream = BufReader::new(&*stream);
+    let mut buf = Vec::with_capacity(RECV_SIZE);
+    unsafe {
+        buf.set_len(RECV_SIZE);
+    }
+    let mut prev_packet_size = 0usize;
     while player.is_alive.load(Ordering::Relaxed) {
-        if let Ok(p) = read_packet(&mut stream, player).await {
+        if let Ok(p) = read_packet(&mut stream, player, &mut buf, &mut prev_packet_size).await {
             player = p
         } else {
             eprintln!("Error occured in read_packet");
