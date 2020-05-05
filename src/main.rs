@@ -150,16 +150,16 @@ async fn process_login(
 }
 
 fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
-    let recv_buf;
-    let prev_size;
+    let recv_buf: &mut [u8];
+    let prev_size: &mut usize;
     unsafe {
         recv_buf = &mut *player.recv_buf.get();
         prev_size = &mut *player.prev_packet_size.get();
     }
-    let recv_buf = &mut recv_buf[..received_size];
+    let recv_buf = &mut recv_buf[..(*prev_size + received_size)];
     let mut packet_head_idx = 0;
 
-    while packet_head_idx < received_size {
+    while packet_head_idx < recv_buf.len() {
         let packet_size = recv_buf[packet_head_idx] as usize;
 
         if packet_size < 2 {
@@ -169,19 +169,17 @@ fn assemble_packet(player: Arc<Player>, received_size: usize) -> Arc<Player> {
         }
 
         let packet_tail_idx = packet_head_idx + packet_size;
-        if packet_tail_idx <= received_size {
-            process_packet(
-                &recv_buf[packet_head_idx..packet_tail_idx],
-                &player,
-            );
+        if packet_tail_idx <= recv_buf.len() {
+            process_packet(&recv_buf[packet_head_idx..packet_tail_idx], &player);
             packet_head_idx = packet_tail_idx;
+            *prev_size = 0;
         } else {
             recv_buf.copy_within(packet_head_idx.., 0);
+            *prev_size = recv_buf.len() - packet_head_idx;
             break;
         }
     }
 
-    *prev_size = received_size - packet_head_idx;
     player
 }
 
