@@ -313,6 +313,12 @@ struct CmdOption {
     #[structopt(short, long, default_value = "9000")]
     port: u16,
 
+    #[structopt(long, default_value = "50")]
+    accept_delay: usize,
+
+    #[structopt(long, default_value = "2")]
+    accept_delay_multiplier: usize,
+
     #[structopt(short, long, default_value = "127.0.0.1")]
     ip_addr: String,
 }
@@ -356,13 +362,13 @@ async fn main() {
         let mut last_login_time = Instant::now();
         let mut delay_multiplier = 1;
         let mut is_increasing = true;
-        let accept_delay = 50;
+        let accept_delay = opt.accept_delay as u128;
         let mut client_to_disconnect = 0;
         let mut max_player_num = unsafe { MAX_TEST };
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
-            if elapsed_time < (accept_delay as u128 * delay_multiplier) {
+            if elapsed_time < (accept_delay * delay_multiplier) {
                 continue;
             }
 
@@ -376,7 +382,7 @@ async fn main() {
                 if cur_player_num < 100 {
                     continue;
                 }
-                if elapsed_time < (accept_delay * 2) as u128 {
+                if elapsed_time < accept_delay * 2 {
                     continue;
                 }
 
@@ -385,7 +391,7 @@ async fn main() {
                 client_to_disconnect += 1;
                 continue;
             } else if DELAY_THRESHOLD < g_delay {
-                delay_multiplier = 2;
+                delay_multiplier = opt.accept_delay_multiplier as u128;
                 continue;
             }
 
