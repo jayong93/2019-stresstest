@@ -1,3 +1,4 @@
+use anyhow::{anyhow, bail, ensure, Context, Error, Result};
 use async_std::{
     io::{prelude::*, BufReader},
     net, task,
@@ -13,8 +14,12 @@ use rand::prelude::*;
 use std::collections::hash_map::RandomState;
 use std::io::{stdout, Write};
 use std::str::FromStr;
+use std::string::ToString;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{mpsc::channel, Arc};
+use std::sync::{
+    mpsc::{channel, Sender},
+    Arc,
+};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use structopt::StructOpt;
 use tui::{
@@ -23,7 +28,7 @@ use tui::{
     style::Color,
     widgets::{
         canvas::{Canvas, Points},
-        Block, Borders, Paragraph, Text,
+        Block, Borders, List, Paragraph, Text,
     },
     Terminal,
 };
@@ -107,18 +112,17 @@ fn from_bytes<T>(bytes: &[u8]) -> &T {
 async fn process_login(
     stream: &mut net::TcpStream,
     write_handle: &mut WriteHandle<i32, Arc<Player>, (), RandomState>,
-) -> Option<Arc<Player>> {
+) -> Result<Arc<Player>> {
     let mut read_buf = vec![0; 256];
-    if let Err(e) = stream.read_exact(&mut read_buf[0..1]).await {
-        eprintln!("Can't process login: {}", e);
-        return None;
-    }
-
+    stream
+        .read_exact(&mut read_buf[0..1])
+        .await
+        .context("Can't process login")?;
     let total_size = read_buf[0] as usize;
-    if let Err(e) = stream.read_exact(&mut read_buf[1..total_size]).await {
-        eprintln!("Can't process login: {}", e);
-        return None;
-    }
+    stream
+        .read_exact(&mut read_buf[1..total_size])
+        .await
+        .context("Can't process login")?;
 
     use packet::*;
     match FromPrimitive::from_u8(read_buf[1]) {
@@ -128,28 +132,22 @@ async fn process_login(
             let player = Arc::new(Player::new(id, p.x, p.y));
             write_handle.insert(id, player.clone());
             write_handle.refresh();
-            Some(player)
+            Ok(player)
         }
-        Some(p) => {
-            eprintln!(
-                "the server has sent a packet that isn't a login packet. It was {:#?}",
-                p
-            );
-            None
-        }
-        _ => {
-            eprintln!("the server has sent unknown packet type {}", read_buf[1]);
-            None
-        }
+        Some(p) => bail!(
+            "the server has sent a packet that isn't a login packet. It was {:#?}",
+            p
+        ),
+        _ => bail!("the server has sent unknown packet type {}", read_buf[1]),
     }
 }
 
 async fn assemble_packet(
-    player: Arc<Player>,
+    player: &Player,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
     received_size: usize,
-) -> Arc<Player> {
+) -> Result<()> {
     let recv_buf = &mut buf[..(*prev_packet_size + received_size)];
     let mut packet_head_idx = 0;
 
@@ -157,14 +155,12 @@ async fn assemble_packet(
         let packet_size = recv_buf[packet_head_idx] as usize;
 
         if packet_size < 2 {
-            eprintln!("a packet size was less than 2");
-            *prev_packet_size = 0;
-            return player;
+            bail!("a packet size was less than 2. It was {}", 2);
         }
 
         let packet_tail_idx = packet_head_idx + packet_size;
         if packet_tail_idx <= recv_buf.len() {
-            process_packet(&recv_buf[packet_head_idx..packet_tail_idx], &player);
+            process_packet(&recv_buf[packet_head_idx..packet_tail_idx], player)?;
             packet_head_idx = packet_tail_idx;
             *prev_packet_size = 0;
         } else {
@@ -173,13 +169,13 @@ async fn assemble_packet(
             break;
         }
     }
-
-    player
+    Ok(())
 }
 
-fn process_packet(packet: &[u8], player: &Arc<Player>) {
+fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
     use packet::{SCPacketType, SCPosPlayer};
-    match FromPrimitive::from_u8(packet[1]) {
+    let packet_type = *packet.get(1).ok_or(anyhow!("packet has no type field"))?;
+    match FromPrimitive::from_u8(packet_type) {
         Some(SCPacketType::Pos) => {
             let p = from_bytes::<SCPosPlayer>(packet);
             let id = p.id;
@@ -201,27 +197,22 @@ fn process_packet(packet: &[u8], player: &Arc<Player>) {
         }
         _ => {}
     }
+    Ok(())
 }
 
 async fn read_packet(
     stream: &mut BufReader<&net::TcpStream>,
-    player: Arc<Player>,
+    player: &Player,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
-) -> Result<Arc<Player>, ()> {
-    let read_size = stream
-        .read(&mut buf[*prev_packet_size..])
-        .await
-        .map_err(|e| eprintln!("{}", e))?;
-    if read_size == 0 {
-        eprintln!("Read zero byte");
-        return Err(());
-    }
+) -> Result<()> {
+    let read_size = stream.read(&mut buf[*prev_packet_size..]).await?;
+    ensure!(read_size > 0, "Read zero byte");
 
-    Ok(assemble_packet(player, buf, prev_packet_size, read_size).await)
+    assemble_packet(player, buf, prev_packet_size, read_size).await
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, mut player: Arc<Player>) {
+async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Sender<Error>) {
     let mut stream = BufReader::new(&*stream);
     let mut buf = Vec::with_capacity(RECV_SIZE);
     unsafe {
@@ -229,16 +220,21 @@ async fn receiver(stream: Arc<net::TcpStream>, mut player: Arc<Player>) {
     }
     let mut prev_packet_size = 0usize;
     while player.is_alive.load(Ordering::Relaxed) {
-        if let Ok(p) = read_packet(&mut stream, player, &mut buf, &mut prev_packet_size).await {
-            player = p
-        } else {
-            eprintln!("Error occured in read_packet");
+        if let Err(e) = read_packet(
+            &mut stream,
+            player.as_ref(),
+            &mut buf,
+            &mut prev_packet_size,
+        )
+        .await
+        {
+            err_send.send(e).expect("Can't send error message");
             return;
         }
     }
 }
 
-async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
+async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Sender<Error>) {
     let mut stream = stream.as_ref();
 
     let tele_packet = packet::CSTeleport::new();
@@ -248,10 +244,14 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
             std::mem::size_of::<packet::CSTeleport>(),
         )
     };
-    stream
+    if let Err(e) = stream
         .write_all(p_bytes)
         .await
-        .expect("Can't send teleport packet");
+        .context("Can't send teleport packet")
+    {
+        err_send.send(e).expect("Can't send error message");
+        return;
+    }
 
     let mut packets = [
         packet::CSMove::new(packet::Direction::Up, 0),
@@ -270,8 +270,12 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>) {
                 std::mem::size_of::<packet::CSMove>(),
             )
         };
-        if stream.write_all(bytes).await.is_err() {
-            eprintln!("Can't send to the server");
+        if let Err(e) = stream
+            .write_all(bytes)
+            .await
+            .context("Can't send to server")
+        {
+            err_send.send(e).expect("Can't send error message");
             return;
         }
         task::sleep(Duration::from_millis(1000)).await;
@@ -316,6 +320,7 @@ struct CmdOption {
 enum Event<I> {
     Key(I),
     Tick,
+    Err(Error),
 }
 
 #[async_std::main]
@@ -340,6 +345,8 @@ async fn main() {
     let (read_handle, mut write_handle) = Options::default()
         .with_capacity(unsafe { MAX_TEST } as usize)
         .construct();
+
+    let (err_send, err_recv) = channel();
 
     let server = async move {
         let mut handle = None;
@@ -405,26 +412,41 @@ async fn main() {
                             std::mem::size_of::<packet::CSLogin>(),
                         )
                     };
-                    client
+                    if let None = client
                         .write_all(p_bytes)
                         .await
-                        .expect("Can't send login packet");
+                        .context("Can't send login packet")
+                        .map_err(|e| err_send.send(e))
+                        .ok()
+                    {
+                        continue;
+                    }
 
-                    if let Some(player) = process_login(&mut client, &mut write_handle).await {
+                    if let Ok(player) = process_login(&mut client, &mut write_handle)
+                        .await
+                        .context("Can't process login")
+                        .map_err(|e| err_send.send(e))
+                    {
+                        let err_send = err_send.clone();
                         handle = Some(task::spawn(async move {
                             let client = Arc::new(client);
-                            let recv = task::spawn(receiver(client.clone(), player.clone()));
-                            let send = task::spawn(sender(client, player));
+                            let recv = task::spawn(receiver(
+                                client.clone(),
+                                player.clone(),
+                                err_send.clone(),
+                            ));
+                            let send = task::spawn(sender(client, player, err_send));
                             recv.await;
                             send.await;
                         }));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        eprintln!("Can't process login");
                         continue;
                     }
                 }
-                Err(e) => eprintln!("Can't connect to server: {}", e),
+                Err(e) => {
+                    err_send.send(anyhow!("Can't connect to server: {}", e)).expect("Can't send error message");
+                }
             }
             // 접속 시도
         }
@@ -453,6 +475,9 @@ async fn main() {
                 tx.send(Event::Tick).expect("Can't send event message");
                 last_tick = Instant::now();
             }
+            for err in err_recv.try_iter() {
+                tx.send(Event::Err(err)).expect("Can't send event message");
+            }
             std::thread::yield_now();
         }
     });
@@ -466,6 +491,7 @@ async fn main() {
             let backend = CrosstermBackend::new(stdout);
             let mut terminal = Terminal::new(backend).expect("Can't create a terminal");
             terminal.hide_cursor().expect("Can't hide a cursor");
+            let mut err_vec = Vec::new();
 
             while let Ok(e) = rx.recv() {
                 match e {
@@ -490,8 +516,12 @@ async fn main() {
                                 let layout = Layout::default()
                                     .direction(Direction::Vertical)
                                     .constraints(
-                                        [Constraint::Percentage(10), Constraint::Percentage(90)]
-                                            .as_ref(),
+                                        [
+                                            Constraint::Percentage(10),
+                                            Constraint::Percentage(80),
+                                            Constraint::Percentage(10),
+                                        ]
+                                        .as_ref(),
                                     )
                                     .split(f.size());
                                 let text = [
@@ -526,6 +556,13 @@ async fn main() {
                                     .x_bounds([0.0, unsafe { BOARD_SIZE as f64 }])
                                     .y_bounds([0.0, unsafe { BOARD_SIZE as f64 }]);
                                 f.render_widget(canvas, layout[1]);
+                                let list = List::new(
+                                    err_vec
+                                        .iter()
+                                        .map(|s: &String| Text::Raw(s.as_str().into())),
+                                )
+                                .block(Block::default().borders(Borders::ALL).title("Errors"));
+                                f.render_widget(list, layout[2]);
                             })
                             .expect("Can't draw to screen");
                     }
@@ -540,6 +577,7 @@ async fn main() {
                         terminal.show_cursor().expect("Can't show cursor");
                         break;
                     }
+                    Event::Err(e) => err_vec.push(e.to_string()),
                     _ => {}
                 }
             }
