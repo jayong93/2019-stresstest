@@ -445,7 +445,9 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    err_send.send(anyhow!("Can't connect to server: {}", e)).expect("Can't send error message");
+                    err_send
+                        .send(anyhow!("Can't connect to server: {}", e))
+                        .expect("Can't send error message");
                 }
             }
             // 접속 시도
@@ -559,6 +561,8 @@ async fn main() {
                                 let list = List::new(
                                     err_vec
                                         .iter()
+                                        .rev()
+                                        .take(10)
                                         .map(|s: &String| Text::Raw(s.as_str().into())),
                                 )
                                 .block(Block::default().borders(Borders::ALL).title("Errors"));
