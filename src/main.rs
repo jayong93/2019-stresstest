@@ -234,7 +234,7 @@ async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Se
     }
 }
 
-async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Sender<Error>) {
+async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Sender<Error>, sleep_time: Duration) {
     let mut stream = stream.as_ref();
 
     let tele_packet = packet::CSTeleport::new();
@@ -278,7 +278,7 @@ async fn sender(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Send
             err_send.send(e).expect("Can't send error message");
             return;
         }
-        task::sleep(Duration::from_millis(1000)).await;
+        task::sleep(sleep_time).await;
     }
 }
 
@@ -298,7 +298,7 @@ struct CmdOption {
     #[structopt(short, long, default_value = "400")]
     board_size: u16,
 
-    #[structopt(short, long, default_value = "1000")]
+    #[structopt(short, long, default_value = "10000")]
     max_player: usize,
 
     #[structopt(short, long, default_value = "800")]
@@ -309,6 +309,9 @@ struct CmdOption {
 
     #[structopt(long, default_value = "50")]
     accept_delay: usize,
+
+    #[structopt(long, default_value = "1000")]
+    move_cycle: u64,
 
     #[structopt(long, default_value = "2")]
     accept_delay_multiplier: usize,
@@ -362,6 +365,7 @@ async fn main() {
         let accept_delay = opt.accept_delay as u128;
         let mut client_to_disconnect = 0;
         let mut max_player_num = unsafe { MAX_TEST };
+        let move_cycle = Duration::from_millis(opt.move_cycle);
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -435,7 +439,7 @@ async fn main() {
                                 player.clone(),
                                 err_send.clone(),
                             ));
-                            let send = task::spawn(sender(client, player, err_send));
+                            let send = task::spawn(sender(client, player, err_send, move_cycle));
                             recv.await;
                             send.await;
                         }));
