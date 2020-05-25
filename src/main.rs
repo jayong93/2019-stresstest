@@ -44,8 +44,6 @@ static mut CELL_SIZE: f32 = 0.0;
 static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
-const DELAY_THRESHOLD: usize = 100;
-const DELAY_THRESHOLD_2: usize = 150;
 
 #[derive(Debug)]
 struct Player {
@@ -182,15 +180,15 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
 
             if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
-            }
-            if p.move_time != 0 {
-                let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
-                let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                if global_delay < d_ms as usize {
-                    GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                } else if global_delay > d_ms as usize {
-                    if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
+                if p.move_time != 0 {
+                    let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
+                    let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+                    if global_delay < d_ms as usize {
                         GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
+                    } else if global_delay > d_ms as usize {
+                        if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
+                            GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -321,6 +319,9 @@ struct CmdOption {
     #[structopt(long, default_value = "2")]
     accept_delay_multiplier: usize,
 
+    #[structopt(long, default_value = "100")]
+    delay_threshold: usize,
+
     #[structopt(short, long, default_value = "127.0.0.1")]
     ip_addr: String,
 }
@@ -371,6 +372,8 @@ async fn main() {
         let mut client_to_disconnect = 0;
         let mut max_player_num = unsafe { MAX_TEST };
         let move_cycle = Duration::from_millis(opt.move_cycle);
+        let delay_threshold = opt.delay_threshold as usize;
+        let delay_threshold2 = (delay_threshold as f64 * 1.5) as usize;
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -380,7 +383,7 @@ async fn main() {
 
             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
             let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
-            if DELAY_THRESHOLD_2 < g_delay {
+            if delay_threshold2 < g_delay {
                 if is_increasing {
                     max_player_num = cur_player_num;
                     is_increasing = false;
@@ -396,7 +399,7 @@ async fn main() {
                 disconnect_client(client_to_disconnect, &mut write_handle);
                 client_to_disconnect += 1;
                 continue;
-            } else if DELAY_THRESHOLD < g_delay {
+            } else if delay_threshold < g_delay {
                 delay_multiplier = opt.accept_delay_multiplier as u128;
                 continue;
             }
