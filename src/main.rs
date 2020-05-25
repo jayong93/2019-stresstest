@@ -180,15 +180,15 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
 
             if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
-                if p.move_time != 0 {
-                    let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
-                    let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                    if global_delay < d_ms as usize {
+            }
+            if p.move_time != 0 {
+                let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
+                let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+                if global_delay < d_ms as usize {
+                    GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
+                } else if global_delay > d_ms as usize {
+                    if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
                         GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                    } else if global_delay > d_ms as usize {
-                        if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
-                            GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                        }
                     }
                 }
             }
