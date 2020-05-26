@@ -172,7 +172,16 @@ async fn assemble_packet(
 }
 
 fn adjust_delay(counter: &AtomicIsize, move_time: u32) {
-    let d_ms = (UNIX_EPOCH.elapsed().unwrap().as_millis() - move_time as u128) as isize;
+    use std::time::SystemTime;
+    let curr_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u32;
+    if curr_time < move_time {
+        return;
+    }
+
+    let d_ms = (curr_time - move_time) as isize;
     let mut delay = counter.load(Ordering::Relaxed);
     if delay < d_ms {
         counter.fetch_add(d_ms - delay, Ordering::Relaxed);
