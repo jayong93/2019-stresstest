@@ -15,7 +15,7 @@ use std::collections::hash_map::RandomState;
 use std::io::{stdout, Write};
 use std::str::FromStr;
 use std::string::ToString;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{
     mpsc::{channel, Sender},
     Arc,
@@ -43,7 +43,8 @@ static mut BOARD_SIZE: usize = 0;
 static mut CELL_SIZE: f32 = 0.0;
 static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
-static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
+static INTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
+static EXTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Debug)]
 struct Player {
@@ -75,7 +76,7 @@ const RECV_SIZE: usize = 1024;
 impl Player {
     fn new(id: i32, x: i16, y: i16) -> Self {
         Player {
-            id: id,
+            id,
             position: AtomicU32::new(Self::compose_position(x, y)),
             is_alive: AtomicBool::new(true),
         }
@@ -170,6 +171,24 @@ async fn assemble_packet(
     Ok(())
 }
 
+fn adjust_delay(counter: &AtomicIsize, move_time: u32) {
+    let d_ms = (UNIX_EPOCH.elapsed().unwrap().as_millis() - move_time as u128) as isize;
+    let mut delay = counter.load(Ordering::Relaxed);
+    if delay < d_ms {
+        counter.fetch_add(d_ms - delay, Ordering::Relaxed);
+    } else if delay > d_ms {
+        let val = delay - d_ms;
+        while delay >= val {
+            let prev_delay = counter.compare_and_swap(delay, delay - val, Ordering::Relaxed);
+            if prev_delay == delay {
+                break;
+            } else {
+                delay = prev_delay;
+            }
+        }
+    }
+}
+
 fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
     use packet::{SCPacketType, SCPosPlayer};
     let packet_type = *packet.get(1).ok_or(anyhow!("packet has no type field"))?;
@@ -180,26 +199,11 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
 
             if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
-            }
-            if p.move_time != 0 {
-                let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
-                let mut global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
-                if global_delay < d_ms as usize {
-                    GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
-                } else if global_delay > d_ms as usize {
-                    while global_delay > 0 {
-                        let prev_delay = GLOBAL_DELAY.compare_and_swap(
-                            global_delay,
-                            global_delay - 1,
-                            Ordering::Relaxed,
-                        );
-                        if prev_delay == global_delay {
-                            break;
-                        } else {
-                            global_delay = prev_delay;
-                        }
-                    }
+                if p.move_time != 0 {
+                    adjust_delay(&INTERNAL_DELAY, p.move_time);
                 }
+            } else if p.move_time != 0 {
+                adjust_delay(&EXTERNAL_DELAY, p.move_time);
             }
         }
         _ => {}
@@ -390,9 +394,9 @@ async fn main() {
                 continue;
             }
 
-            let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+            let internal_delay = INTERNAL_DELAY.load(Ordering::Relaxed);
             let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
-            if delay_threshold2 < g_delay {
+            if delay_threshold2 < internal_delay as _ {
                 if is_increasing {
                     max_player_num = cur_player_num;
                     is_increasing = false;
@@ -408,7 +412,7 @@ async fn main() {
                 disconnect_client(client_to_disconnect, &mut write_handle);
                 client_to_disconnect += 1;
                 continue;
-            } else if delay_threshold < g_delay {
+            } else if delay_threshold < internal_delay as _ {
                 delay_multiplier = opt.accept_delay_multiplier as u128;
                 continue;
             }
@@ -550,8 +554,9 @@ async fn main() {
                                 let text = [
                                     Text::Raw(
                                         format!(
-                                            "Delay: {} ms, ",
-                                            GLOBAL_DELAY.load(Ordering::Relaxed)
+                                            "Internal Delay: {} ms, External Dalay: {} ms, ",
+                                            INTERNAL_DELAY.load(Ordering::Relaxed),
+                                            EXTERNAL_DELAY.load(Ordering::Relaxed),
                                         )
                                         .into(),
                                     ),
