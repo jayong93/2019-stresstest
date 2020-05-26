@@ -183,12 +183,21 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
             }
             if p.move_time != 0 {
                 let d_ms = UNIX_EPOCH.elapsed().unwrap().as_millis() as u32 - p.move_time;
-                let global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
+                let mut global_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
                 if global_delay < d_ms as usize {
                     GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
                 } else if global_delay > d_ms as usize {
-                    if GLOBAL_DELAY.fetch_sub(1, Ordering::Relaxed) == 0 {
-                        GLOBAL_DELAY.fetch_add(1, Ordering::Relaxed);
+                    while global_delay > 0 {
+                        let prev_delay = GLOBAL_DELAY.compare_and_swap(
+                            global_delay,
+                            global_delay - 1,
+                            Ordering::Relaxed,
+                        );
+                        if prev_delay == global_delay {
+                            break;
+                        } else {
+                            global_delay = prev_delay;
+                        }
                     }
                 }
             }
