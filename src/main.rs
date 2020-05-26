@@ -560,23 +560,15 @@ async fn main() {
                                         .as_ref(),
                                     )
                                     .split(f.size());
-                                let text = [
-                                    Text::Raw(
-                                        format!(
-                                            "Internal Delay: {} ms, External Dalay: {} ms, ",
-                                            INTERNAL_DELAY.load(Ordering::Relaxed),
-                                            EXTERNAL_DELAY.load(Ordering::Relaxed),
-                                        )
-                                        .into(),
-                                    ),
-                                    Text::Raw(
-                                        format!(
-                                            "Players: {}\n",
-                                            PLAYER_NUM.load(Ordering::Relaxed)
-                                        )
-                                        .into(),
-                                    ),
-                                ];
+                                let text = [Text::Raw(
+                                    format!(
+                                        "Internal Delay: {} ms\nExternal Dalay: {} ms\nPlayers: {}",
+                                        INTERNAL_DELAY.load(Ordering::Relaxed),
+                                        EXTERNAL_DELAY.load(Ordering::Relaxed),
+                                        PLAYER_NUM.load(Ordering::Relaxed),
+                                    )
+                                    .into(),
+                                )];
                                 let para = Paragraph::new(text.iter())
                                     .block(Block::default().borders(Borders::ALL).title("Info"))
                                     .wrap(true);
