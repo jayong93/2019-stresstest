@@ -38,14 +38,11 @@ mod packet;
 type PlayerMapRead = ReadHandle<i32, Arc<Player>, (), RandomState>;
 
 static mut MAX_TEST: u64 = 0;
-static mut WINDOW_SIZE: (usize, usize) = (0, 0);
-static mut BOARD_SIZE: usize = 0;
-static mut CELL_SIZE: f32 = 0.0;
+static mut BOARD_WIDTH: usize = 0;
+static mut BOARD_HEIGHT: usize = 0;
 static mut PORT: u16 = 0;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DELAY: AtomicUsize = AtomicUsize::new(0);
-const DELAY_THRESHOLD: usize = 100;
-const DELAY_THRESHOLD_2: usize = 150;
 
 #[derive(Debug)]
 struct Player {
@@ -300,14 +297,14 @@ fn disconnect_client(client_id: i32, read_handle: &PlayerMapRead) {
 
 #[derive(Debug, StructOpt)]
 struct CmdOption {
-    #[structopt(short, long, default_value = "400")]
-    board_size: u16,
+    #[structopt(long, default_value = "400")]
+    board_width: u16,
+
+    #[structopt(long, default_value = "400")]
+    board_height: u16,
 
     #[structopt(short, long, default_value = "10000")]
     max_player: usize,
-
-    #[structopt(short, long, default_value = "800")]
-    window_size: Vec<usize>,
 
     #[structopt(short, long, default_value = "9000")]
     port: u16,
@@ -320,6 +317,9 @@ struct CmdOption {
 
     #[structopt(long, default_value = "2")]
     accept_delay_multiplier: usize,
+
+    #[structopt(long, default_value = "100")]
+    delay_threshold: usize,
 
     #[structopt(short, long, default_value = "127.0.0.1")]
     ip_addr: String,
@@ -336,18 +336,9 @@ async fn main() {
     let opt = CmdOption::from_args();
     unsafe {
         MAX_TEST = opt.max_player as u64;
-        match opt.window_size.len() {
-            1 => {
-                let size = opt.window_size.first().unwrap();
-                WINDOW_SIZE = (*size, *size);
-            }
-            _ => {
-                WINDOW_SIZE = (opt.window_size[0], opt.window_size[1]);
-            }
-        }
-        BOARD_SIZE = opt.board_size as usize;
+        BOARD_WIDTH = opt.board_width as usize;
+        BOARD_HEIGHT = opt.board_height as usize;
         PORT = opt.port;
-        CELL_SIZE = (WINDOW_SIZE.0 as f32) / (BOARD_SIZE as f32);
     }
 
     let (read_handle, mut write_handle) = Options::default()
@@ -371,6 +362,8 @@ async fn main() {
         let mut client_to_disconnect = 0;
         let mut max_player_num = unsafe { MAX_TEST };
         let move_cycle = Duration::from_millis(opt.move_cycle);
+        let delay_threshold = opt.delay_threshold as usize;
+        let delay_threshold2 = (delay_threshold as f64 * 1.5) as usize;
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -380,7 +373,7 @@ async fn main() {
 
             let g_delay = GLOBAL_DELAY.load(Ordering::Relaxed);
             let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
-            if DELAY_THRESHOLD_2 < g_delay {
+            if delay_threshold2 < g_delay {
                 if is_increasing {
                     max_player_num = cur_player_num;
                     is_increasing = false;
@@ -396,7 +389,7 @@ async fn main() {
                 disconnect_client(client_to_disconnect, &mut write_handle);
                 client_to_disconnect += 1;
                 continue;
-            } else if DELAY_THRESHOLD < g_delay {
+            } else if delay_threshold < g_delay {
                 delay_multiplier = opt.accept_delay_multiplier as u128;
                 continue;
             }
@@ -564,8 +557,8 @@ async fn main() {
                                         };
                                         ctx.draw(&points);
                                     })
-                                    .x_bounds([0.0, unsafe { BOARD_SIZE as f64 }])
-                                    .y_bounds([0.0, unsafe { BOARD_SIZE as f64 }]);
+                                    .x_bounds([0.0, unsafe { BOARD_WIDTH as f64 }])
+                                    .y_bounds([0.0, unsafe { BOARD_HEIGHT as f64 }]);
                                 f.render_widget(canvas, layout[1]);
                                 let list = List::new(
                                     err_vec
