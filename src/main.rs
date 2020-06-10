@@ -155,7 +155,7 @@ async fn assemble_packet(
         let packet_size = recv_buf[packet_head_idx] as usize;
 
         if packet_size < 2 {
-            bail!("a packet size was less than 2. It was {}", 2);
+            bail!("a packet size was less than 2. It was {}", packet_size);
         }
 
         let packet_tail_idx = packet_head_idx + packet_size;
