@@ -41,6 +41,8 @@ static mut MAX_TEST: u64 = 0;
 static mut BOARD_WIDTH: usize = 0;
 static mut BOARD_HEIGHT: usize = 0;
 static mut PORT: u16 = 0;
+static mut CALC_EXTERNAL_DELAY: bool = false;
+static mut TELEPORT_ON_LOGIN: bool = false;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static INTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
 static EXTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
@@ -210,7 +212,7 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
                 if p.move_time != 0 {
                     adjust_delay(&INTERNAL_DELAY, p.move_time);
                 }
-            } else if p.move_time != 0 {
+            } else if unsafe { CALC_EXTERNAL_DELAY } && p.move_time != 0 {
                 adjust_delay(&EXTERNAL_DELAY, p.move_time);
             }
         }
@@ -261,21 +263,23 @@ async fn sender(
 ) {
     let mut stream = stream.as_ref();
 
-    // let tele_packet = packet::CSTeleport::new();
-    // let p_bytes = unsafe {
-    //     std::slice::from_raw_parts(
-    //         &tele_packet as *const packet::CSTeleport as *const u8,
-    //         std::mem::size_of::<packet::CSTeleport>(),
-    //     )
-    // };
-    // if let Err(e) = stream
-    //     .write_all(p_bytes)
-    //     .await
-    //     .context("Can't send teleport packet")
-    // {
-    //     err_send.send(e).expect("Can't send error message");
-    //     return;
-    // }
+    if unsafe { TELEPORT_ON_LOGIN } {
+        let tele_packet = packet::CSTeleport::new();
+        let p_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &tele_packet as *const packet::CSTeleport as *const u8,
+                std::mem::size_of::<packet::CSTeleport>(),
+            )
+        };
+        if let Err(e) = stream
+            .write_all(p_bytes)
+            .await
+            .context("Can't send teleport packet")
+        {
+            err_send.send(e).expect("Can't send error message");
+            return;
+        }
+    }
 
     let mut packets = [
         packet::CSMove::new(packet::Direction::Up, 0),
@@ -331,6 +335,12 @@ struct CmdOption {
     #[structopt(short, long, default_value = "9000")]
     port: u16,
 
+    #[structopt(long)]
+    use_external_delay: bool,
+
+    #[structopt(long)]
+    teleport_on_login: bool,
+
     #[structopt(long, default_value = "50")]
     accept_delay: usize,
 
@@ -361,6 +371,8 @@ async fn main() {
         BOARD_WIDTH = opt.board_width as usize;
         BOARD_HEIGHT = opt.board_height as usize;
         PORT = opt.port;
+        CALC_EXTERNAL_DELAY = opt.use_external_delay;
+        TELEPORT_ON_LOGIN = opt.teleport_on_login;
     }
 
     let (read_handle, mut write_handle) = Options::default()
@@ -550,12 +562,20 @@ async fn main() {
                                     )
                                     .split(f.size());
                                 let text = [Text::Raw(
-                                    format!(
+                                    if unsafe { CALC_EXTERNAL_DELAY } {
+                                        format!(
                                         "Internal Delay: {} ms\nExternal Dalay: {} ms\nPlayers: {}",
                                         INTERNAL_DELAY.load(Ordering::Relaxed),
                                         EXTERNAL_DELAY.load(Ordering::Relaxed),
                                         PLAYER_NUM.load(Ordering::Relaxed),
                                     )
+                                    } else {
+                                        format!(
+                                            "Delay: {} ms\nPlayers: {}",
+                                            INTERNAL_DELAY.load(Ordering::Relaxed),
+                                            PLAYER_NUM.load(Ordering::Relaxed),
+                                        )
+                                    }
                                     .into(),
                                 )];
                                 let para = Paragraph::new(text.iter())
