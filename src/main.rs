@@ -114,12 +114,12 @@ async fn process_login(
     stream
         .read_exact(&mut read_buf[0..1])
         .await
-        .context("Can't process login")?;
+        .context("Can't read packet size from server")?;
     let total_size = read_buf[0] as usize;
     stream
         .read_exact(&mut read_buf[1..total_size])
         .await
-        .context("Can't process login")?;
+        .context("Can't read packets from server")?;
 
     use packet::*;
     match FromPrimitive::from_u8(read_buf[1]) {
@@ -239,21 +239,21 @@ async fn sender(
 ) {
     let mut stream = stream.as_ref();
 
-    let tele_packet = packet::CSTeleport::new();
-    let p_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &tele_packet as *const packet::CSTeleport as *const u8,
-            std::mem::size_of::<packet::CSTeleport>(),
-        )
-    };
-    if let Err(e) = stream
-        .write_all(p_bytes)
-        .await
-        .context("Can't send teleport packet")
-    {
-        err_send.send(e).expect("Can't send error message");
-        return;
-    }
+    // let tele_packet = packet::CSTeleport::new();
+    // let p_bytes = unsafe {
+    //     std::slice::from_raw_parts(
+    //         &tele_packet as *const packet::CSTeleport as *const u8,
+    //         std::mem::size_of::<packet::CSTeleport>(),
+    //     )
+    // };
+    // if let Err(e) = stream
+    //     .write_all(p_bytes)
+    //     .await
+    //     .context("Can't send teleport packet")
+    // {
+    //     err_send.send(e).expect("Can't send error message");
+    //     return;
+    // }
 
     let mut packets = [
         packet::CSMove::new(packet::Direction::Up, 0),
@@ -426,7 +426,6 @@ async fn main() {
 
                     if let Ok(player) = process_login(&mut client, &mut write_handle)
                         .await
-                        .context("Can't process login")
                         .map_err(|e| err_send.send(e))
                     {
                         let err_send = err_send.clone();
