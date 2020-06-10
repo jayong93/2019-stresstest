@@ -554,9 +554,9 @@ async fn main() {
                                     .direction(Direction::Vertical)
                                     .constraints(
                                         [
-                                            Constraint::Percentage(10),
-                                            Constraint::Percentage(80),
-                                            Constraint::Percentage(10),
+                                            Constraint::Length(5),
+                                            Constraint::Min(0),
+                                            Constraint::Length(6),
                                         ]
                                         .as_ref(),
                                     )
