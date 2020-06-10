@@ -597,9 +597,10 @@ async fn main() {
                                 let list = List::new(
                                     err_vec
                                         .iter()
+                                        .enumerate()
                                         .rev()
                                         .take(10)
-                                        .map(|s: &String| Text::Raw(s.as_str().into())),
+                                        .map(|(i, s) : (_, &String)| Text::Raw(std::borrow::Cow::Owned(format!("#{}: {}", i, s)))),
                                 )
                                 .block(Block::default().borders(Borders::ALL).title("Errors"));
                                 f.render_widget(list, layout[2]);
