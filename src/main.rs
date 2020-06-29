@@ -405,36 +405,38 @@ async fn main() {
                 continue;
             }
 
-            let internal_delay = INTERNAL_DELAY.load(Ordering::Relaxed);
-            let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
-            if delay_threshold2 < internal_delay as _ {
-                if is_increasing {
-                    max_player_num = cur_player_num;
-                    is_increasing = false;
-                }
-                if cur_player_num < 100 {
+            if delay_threshold > 0 {
+                let internal_delay = INTERNAL_DELAY.load(Ordering::Relaxed);
+                let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
+                if delay_threshold2 < internal_delay as _ {
+                    if is_increasing {
+                        max_player_num = cur_player_num;
+                        is_increasing = false;
+                    }
+                    if cur_player_num < 100 {
+                        continue;
+                    }
+                    if elapsed_time < accept_delay * 2 {
+                        continue;
+                    }
+
+                    last_login_time = Instant::now();
+                    disconnect_client(client_to_disconnect, &mut write_handle);
+                    client_to_disconnect += 1;
+                    continue;
+                } else if delay_threshold < internal_delay as _ {
+                    delay_multiplier = opt.accept_delay_multiplier as u128;
                     continue;
                 }
-                if elapsed_time < accept_delay * 2 {
+
+                if max_player_num != unsafe { MAX_TEST }
+                    && max_player_num - (max_player_num / 20) < cur_player_num
+                {
                     continue;
                 }
 
-                last_login_time = Instant::now();
-                disconnect_client(client_to_disconnect, &mut write_handle);
-                client_to_disconnect += 1;
-                continue;
-            } else if delay_threshold < internal_delay as _ {
-                delay_multiplier = opt.accept_delay_multiplier as u128;
-                continue;
+                is_increasing = true;
             }
-
-            if max_player_num != unsafe { MAX_TEST }
-                && max_player_num - (max_player_num / 20) < cur_player_num
-            {
-                continue;
-            }
-
-            is_increasing = true;
             last_login_time = Instant::now();
 
             match net::TcpStream::connect(ip_addr).await {
@@ -594,15 +596,16 @@ async fn main() {
                                     .x_bounds([0.0, unsafe { BOARD_WIDTH as f64 }])
                                     .y_bounds([0.0, unsafe { BOARD_HEIGHT as f64 }]);
                                 f.render_widget(canvas, layout[1]);
-                                let list = List::new(
-                                    err_vec
-                                        .iter()
-                                        .enumerate()
-                                        .rev()
-                                        .take(10)
-                                        .map(|(i, s) : (_, &String)| Text::Raw(std::borrow::Cow::Owned(format!("#{}: {}", i, s)))),
-                                )
-                                .block(Block::default().borders(Borders::ALL).title("Errors"));
+                                let list =
+                                    List::new(err_vec.iter().enumerate().rev().take(10).map(
+                                        |(i, s): (_, &String)| {
+                                            Text::Raw(std::borrow::Cow::Owned(format!(
+                                                "#{}: {}",
+                                                i, s
+                                            )))
+                                        },
+                                    ))
+                                    .block(Block::default().borders(Borders::ALL).title("Errors"));
                                 f.render_widget(list, layout[2]);
                             })
                             .expect("Can't draw to screen");
