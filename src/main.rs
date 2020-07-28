@@ -183,19 +183,11 @@ fn adjust_delay(counter: &AtomicIsize, move_time: u32) {
     }
 
     let d_ms = (curr_time - move_time) as isize;
-    let mut delay = counter.load(Ordering::Relaxed);
+    let delay = counter.load(Ordering::Relaxed);
     if delay < d_ms {
-        counter.fetch_add(d_ms - delay, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
     } else if delay > d_ms {
-        let val = delay - d_ms;
-        while delay >= val {
-            let prev_delay = counter.compare_and_swap(delay, delay - val, Ordering::Relaxed);
-            if prev_delay == delay {
-                break;
-            } else {
-                delay = prev_delay;
-            }
-        }
+        counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
