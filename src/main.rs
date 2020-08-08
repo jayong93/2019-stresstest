@@ -20,7 +20,11 @@ use std::sync::{
     mpsc::{channel, Sender},
     Arc,
 };
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::{
+    fs::OpenOptions,
+    path::PathBuf,
+    time::{Duration, Instant, UNIX_EPOCH},
+};
 use structopt::StructOpt;
 use tui::{
     backend::CrosstermBackend,
@@ -46,6 +50,11 @@ static mut TELEPORT_ON_LOGIN: bool = false;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static INTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
 static EXTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
+static TOTAL_INTERNAL_DELAY_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static TOTAL_INTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static TOTAL_EXTERNAL_DELAY_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static TOTAL_EXTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static TOTAL_PACKET_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 
 #[derive(Debug)]
 struct Player {
@@ -161,6 +170,7 @@ async fn assemble_packet(
         let packet_tail_idx = packet_head_idx + packet_size;
         if packet_tail_idx <= recv_buf.len() {
             process_packet(&recv_buf[packet_head_idx..packet_tail_idx], player)?;
+            TOTAL_PACKET_COUNT_IN_1S.fetch_add(1, Ordering::Relaxed);
             packet_head_idx = packet_tail_idx;
             *prev_packet_size = 0;
         } else {
@@ -172,7 +182,12 @@ async fn assemble_packet(
     Ok(())
 }
 
-fn adjust_delay(counter: &AtomicIsize, move_time: u32) {
+fn adjust_delay(
+    counter: &AtomicIsize,
+    accumulator: &AtomicIsize,
+    delay_acc_counter: &AtomicIsize,
+    move_time: u32,
+) {
     use std::time::SystemTime;
     let curr_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -182,21 +197,17 @@ fn adjust_delay(counter: &AtomicIsize, move_time: u32) {
         return;
     }
 
-    let d_ms = (curr_time - move_time) as isize;
-    let mut delay = counter.load(Ordering::Relaxed);
+    let d_ms = curr_time as isize - move_time as isize;
+    let delay = counter.load(Ordering::Relaxed);
+    let mut cur_delay = delay;
     if delay < d_ms {
-        counter.fetch_add(d_ms - delay, Ordering::Relaxed);
+        cur_delay = counter.fetch_add(d_ms - delay, Ordering::Relaxed) + (d_ms - delay);
     } else if delay > d_ms {
-        let val = delay - d_ms;
-        while delay >= val {
-            let prev_delay = counter.compare_and_swap(delay, delay - val, Ordering::Relaxed);
-            if prev_delay == delay {
-                break;
-            } else {
-                delay = prev_delay;
-            }
-        }
+        cur_delay = counter.fetch_sub(delay - d_ms, Ordering::Relaxed) - (delay - d_ms);
     }
+
+    accumulator.fetch_add(cur_delay, Ordering::Relaxed);
+    delay_acc_counter.fetch_add(1, Ordering::Relaxed);
 }
 
 fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
@@ -210,10 +221,20 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
             if player.id == id {
                 player.set_pos(p.x as i16, p.y as i16);
                 if p.move_time != 0 {
-                    adjust_delay(&INTERNAL_DELAY, p.move_time);
+                    adjust_delay(
+                        &INTERNAL_DELAY,
+                        &TOTAL_INTERNAL_DELAY_IN_1S,
+                        &TOTAL_INTERNAL_DELAY_COUNT_IN_1S,
+                        p.move_time,
+                    );
                 }
             } else if unsafe { CALC_EXTERNAL_DELAY } && p.move_time != 0 {
-                adjust_delay(&EXTERNAL_DELAY, p.move_time);
+                adjust_delay(
+                    &EXTERNAL_DELAY,
+                    &TOTAL_EXTERNAL_DELAY_IN_1S,
+                    &TOTAL_EXTERNAL_DELAY_COUNT_IN_1S,
+                    p.move_time,
+                );
             }
         }
         _ => {}
@@ -355,6 +376,9 @@ struct CmdOption {
 
     #[structopt(short, long, default_value = "127.0.0.1")]
     ip_addr: String,
+
+    #[structopt(long, default_value = "delay.log")]
+    delay_log: PathBuf,
 }
 
 enum Event<I> {
@@ -374,6 +398,14 @@ async fn main() {
         CALC_EXTERNAL_DELAY = opt.use_external_delay;
         TELEPORT_ON_LOGIN = opt.teleport_on_login;
     }
+
+    let mut log_file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(&opt.delay_log)
+        .unwrap();
+    writeln!(&mut log_file, "INTERNAL_DELAY, EXTERNAL_DELAY, PACKETS").unwrap();
 
     let (read_handle, mut write_handle) = Options::default()
         .with_capacity(unsafe { MAX_TEST } as usize)
@@ -499,7 +531,9 @@ async fn main() {
 
     task::spawn_blocking(move || {
         let mut last_tick = Instant::now();
+        let mut elapsed_time_up_to_1s = Duration::default();
         loop {
+            elapsed_time_up_to_1s += last_tick.elapsed();
             if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
                 if event::poll(d_time).expect("Can't poll event") {
                     if let CEvent::Key(key) = event::read().expect("Can't read event") {
@@ -516,6 +550,25 @@ async fn main() {
             }
             for err in err_recv.try_iter() {
                 tx.send(Event::Err(err)).expect("Can't send event message");
+            }
+
+            let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
+            if elapsed_time >= 1. {
+                elapsed_time_up_to_1s = Duration::default();
+                writeln!(
+                    &mut log_file,
+                    "{}, {}, {}",
+                    TOTAL_INTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                        / TOTAL_INTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
+                    TOTAL_EXTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                        / TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
+                    TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
+                )
+                .unwrap();
+                TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+                TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+                TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+                TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
             }
             std::thread::yield_now();
         }
