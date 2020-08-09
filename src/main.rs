@@ -55,6 +55,7 @@ static TOTAL_INTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_PACKET_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static IS_DELAY_LOGGING_START: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct Player {
@@ -422,14 +423,9 @@ async fn main() {
         ip_addr.set_port(unsafe { PORT });
 
         let mut last_login_time = Instant::now();
-        let mut delay_multiplier = 1;
-        let mut is_increasing = true;
+        let delay_multiplier = 1;
         let accept_delay = opt.accept_delay as u128;
-        let mut client_to_disconnect = 0;
-        let mut max_player_num = unsafe { MAX_TEST };
         let move_cycle = Duration::from_millis(opt.move_cycle);
-        let delay_threshold = opt.delay_threshold as usize;
-        let delay_threshold2 = (delay_threshold as f64 * 1.5) as usize;
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -437,38 +433,6 @@ async fn main() {
                 continue;
             }
 
-            if delay_threshold > 0 {
-                let internal_delay = INTERNAL_DELAY.load(Ordering::Relaxed);
-                let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;
-                if delay_threshold2 < internal_delay as _ {
-                    if is_increasing {
-                        max_player_num = cur_player_num;
-                        is_increasing = false;
-                    }
-                    if cur_player_num < 100 {
-                        continue;
-                    }
-                    if elapsed_time < accept_delay * 2 {
-                        continue;
-                    }
-
-                    last_login_time = Instant::now();
-                    disconnect_client(client_to_disconnect, &mut write_handle);
-                    client_to_disconnect += 1;
-                    continue;
-                } else if delay_threshold < internal_delay as _ {
-                    delay_multiplier = opt.accept_delay_multiplier as u128;
-                    continue;
-                }
-
-                if max_player_num != unsafe { MAX_TEST }
-                    && max_player_num - (max_player_num / 20) < cur_player_num
-                {
-                    continue;
-                }
-
-                is_increasing = true;
-            }
             last_login_time = Instant::now();
 
             match net::TcpStream::connect(ip_addr).await {
@@ -519,8 +483,10 @@ async fn main() {
                         .expect("Can't send error message");
                 }
             }
-            // 접속 시도
         }
+
+        IS_DELAY_LOGGING_START.store(true, Ordering::Release);
+
         handle.unwrap().await;
     };
     task::spawn(server);
@@ -533,7 +499,28 @@ async fn main() {
         let mut last_tick = Instant::now();
         let mut elapsed_time_up_to_1s = Duration::default();
         loop {
-            elapsed_time_up_to_1s += last_tick.elapsed();
+            if IS_DELAY_LOGGING_START.load(Ordering::Acquire) {
+                elapsed_time_up_to_1s += last_tick.elapsed();
+                let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
+                if elapsed_time >= 1. {
+                    elapsed_time_up_to_1s = Duration::default();
+                    writeln!(
+                        &mut log_file,
+                        "{}, {}, {}",
+                        TOTAL_INTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                            / TOTAL_INTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
+                        TOTAL_EXTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                            / TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
+                        TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
+                    )
+                    .unwrap();
+                    TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+                    TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+                    TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+                    TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+                }
+            }
+
             if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
                 if event::poll(d_time).expect("Can't poll event") {
                     if let CEvent::Key(key) = event::read().expect("Can't read event") {
@@ -552,24 +539,6 @@ async fn main() {
                 tx.send(Event::Err(err)).expect("Can't send event message");
             }
 
-            let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
-            if elapsed_time >= 1. {
-                elapsed_time_up_to_1s = Duration::default();
-                writeln!(
-                    &mut log_file,
-                    "{}, {}, {}",
-                    TOTAL_INTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
-                        / TOTAL_INTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
-                    TOTAL_EXTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
-                        / TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
-                    TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
-                )
-                .unwrap();
-                TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-                TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-                TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
-                TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
-            }
             std::thread::yield_now();
         }
     });
