@@ -21,7 +21,8 @@ use std::sync::{
     Arc,
 };
 use std::{
-    fs::OpenOptions,
+    cmp::max,
+    fs::{File, OpenOptions},
     path::PathBuf,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -55,7 +56,6 @@ static TOTAL_INTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_PACKET_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
-static IS_DELAY_LOGGING_START: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct Player {
@@ -485,8 +485,6 @@ async fn main() {
             }
         }
 
-        IS_DELAY_LOGGING_START.store(true, Ordering::Release);
-
         handle.unwrap().await;
     };
     task::spawn(server);
@@ -499,28 +497,6 @@ async fn main() {
         let mut last_tick = Instant::now();
         let mut elapsed_time_up_to_1s = Duration::default();
         loop {
-            if IS_DELAY_LOGGING_START.load(Ordering::Acquire) {
-                elapsed_time_up_to_1s += last_tick.elapsed();
-                let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
-                if elapsed_time >= 1. {
-                    elapsed_time_up_to_1s = Duration::default();
-                    writeln!(
-                        &mut log_file,
-                        "{}, {}, {}",
-                        TOTAL_INTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
-                            / TOTAL_INTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
-                        TOTAL_EXTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
-                            / TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed) as f32,
-                        TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
-                    )
-                    .unwrap();
-                    TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-                    TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-                    TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
-                    TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
-                }
-            }
-
             if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
                 if event::poll(d_time).expect("Can't poll event") {
                     if let CEvent::Key(key) = event::read().expect("Can't read event") {
@@ -528,10 +504,12 @@ async fn main() {
                     }
                 }
                 if last_tick.elapsed() > tick_rate {
+                    log_delay(&mut log_file, &mut elapsed_time_up_to_1s, &last_tick.elapsed());
                     tx.send(Event::Tick).expect("Can't send event message");
                     last_tick = Instant::now();
                 }
             } else {
+                log_delay(&mut log_file, &mut elapsed_time_up_to_1s, &last_tick.elapsed());
                 tx.send(Event::Tick).expect("Can't send event message");
                 last_tick = Instant::now();
             }
@@ -653,5 +631,30 @@ async fn main() {
 
     for (id, _) in read_handle.read().iter() {
         disconnect_client(*id, &read_handle);
+    }
+}
+
+fn log_delay(file: &mut File, elapsed_time_up_to_1s: &mut Duration, tick_rate: &Duration) {
+    if PLAYER_NUM.load(Ordering::Relaxed) >= unsafe { MAX_TEST } as usize {
+        *elapsed_time_up_to_1s += *tick_rate;
+        let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
+        if elapsed_time >= 1. {
+            *elapsed_time_up_to_1s = Duration::default();
+            writeln!(
+                file,
+                "{}, {}, {}",
+                TOTAL_INTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                    / max(1, TOTAL_INTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed)) as f32,
+                TOTAL_EXTERNAL_DELAY_IN_1S.load(Ordering::Relaxed) as f32
+                    / max(1, TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.load(Ordering::Relaxed)) as f32,
+                TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
+            )
+            .unwrap();
+            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
+        }
     }
 }
