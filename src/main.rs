@@ -59,6 +59,8 @@ static TOTAL_INTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_EXTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_PACKET_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
+static mut TOTAL_INTERNAL_DELAY_PER_THREAD: Vec<AtomicIsize> = Vec::new();
+static mut TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD: Vec<AtomicIsize> = Vec::new();
 
 #[derive(Debug)]
 struct Player {
@@ -174,7 +176,11 @@ fn assemble_packet(
 
         let packet_tail_idx = packet_head_idx + packet_size;
         if packet_tail_idx <= recv_buf.len() {
-            process_packet(&recv_buf[packet_head_idx..packet_tail_idx], player)?;
+            process_packet(
+                &recv_buf[packet_head_idx..packet_tail_idx],
+                player,
+                delay_send,
+            )?;
             TOTAL_PACKET_COUNT_IN_1S.fetch_add(1, Ordering::Relaxed);
             packet_head_idx = packet_tail_idx;
             *prev_packet_size = 0;
@@ -188,18 +194,20 @@ fn assemble_packet(
 }
 
 fn adjust_delay(
+    id: isize,
     counter: &AtomicIsize,
     accumulator: &AtomicIsize,
     delay_acc_counter: &AtomicIsize,
     move_time: u32,
-) {
+    delay_send: &Sender<isize>,
+) -> Result<()> {
     use std::time::SystemTime;
     let curr_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u32;
     if curr_time < move_time {
-        return;
+        return Ok(());
     }
 
     let d_ms = curr_time as isize - move_time as isize;
@@ -211,11 +219,27 @@ fn adjust_delay(
         cur_delay = counter.fetch_sub(delay - d_ms, Ordering::Relaxed) - (delay - d_ms);
     }
 
-    accumulator.fetch_add(cur_delay, Ordering::Relaxed);
-    delay_acc_counter.fetch_add(1, Ordering::Relaxed);
+    if unsafe { LOG_ALL_DELAY } {
+        delay_send.send(d_ms)?;
+    }
+
+    if let Some(thread_num) =
+        unsafe { SERVER_THREAD_NUM.filter(|_| id >= 0).map(NonZeroUsize::get) }
+    {
+        let tid = id as usize % thread_num;
+        unsafe {
+            TOTAL_INTERNAL_DELAY_PER_THREAD[tid].fetch_add(cur_delay, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD[tid].fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        accumulator.fetch_add(cur_delay, Ordering::Relaxed);
+        delay_acc_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    Ok(())
 }
 
-fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
+fn process_packet(packet: &[u8], player: &Player, delay_send: &Sender<isize>) -> Result<()> {
     use packet::{SCPacketType, SCPosPlayer};
     let packet_type = *packet.get(1).ok_or(anyhow!("packet has no type field"))?;
     match FromPrimitive::from_u8(packet_type) {
@@ -227,19 +251,23 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
                 player.set_pos(p.x as i16, p.y as i16);
                 if p.move_time != 0 {
                     adjust_delay(
+                        player.id as isize,
                         &INTERNAL_DELAY,
                         &TOTAL_INTERNAL_DELAY_IN_1S,
                         &TOTAL_INTERNAL_DELAY_COUNT_IN_1S,
                         p.move_time,
-                    );
+                        delay_send,
+                    )?;
                 }
             } else if unsafe { CALC_EXTERNAL_DELAY } && p.move_time != 0 {
                 adjust_delay(
+                    -1,
                     &EXTERNAL_DELAY,
                     &TOTAL_EXTERNAL_DELAY_IN_1S,
                     &TOTAL_EXTERNAL_DELAY_COUNT_IN_1S,
                     p.move_time,
-                );
+                    delay_send,
+                )?;
             }
         }
         _ => {}
@@ -249,7 +277,6 @@ fn process_packet(packet: &[u8], player: &Player) -> Result<()> {
 
 async fn read_packet(
     stream: &mut BufReader<&net::TcpStream>,
-    player: &Player,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
 ) -> Result<usize> {
@@ -271,22 +298,17 @@ async fn receiver(
     }
     let mut prev_packet_size = 0usize;
     while player.is_alive.load(Ordering::Relaxed) {
-        match read_packet(
-            &mut stream,
-            player.as_ref(),
-            &mut buf,
-            &mut prev_packet_size,
-        )
-        .await
-        .and_then(|read_size| {
-            assemble_packet(
-                player.as_ref(),
-                &mut buf,
-                &mut prev_packet_size,
-                read_size,
-                &delay_send,
-            )
-        }) {
+        match read_packet(&mut stream, &mut buf, &mut prev_packet_size)
+            .await
+            .and_then(|read_size| {
+                assemble_packet(
+                    player.as_ref(),
+                    &mut buf,
+                    &mut prev_packet_size,
+                    read_size,
+                    &delay_send,
+                )
+            }) {
             Ok(_) => {}
             Err(e) => {
                 err_send.send(e).expect("Can't send error message");
@@ -402,7 +424,7 @@ struct CmdOption {
     #[structopt(long)]
     server_thread_num: Option<NonZeroUsize>,
 
-    #[structopt(long)]
+    #[structopt(long, conflicts_with = "server-thread-num")]
     log_all_delay: bool,
 }
 
@@ -412,6 +434,7 @@ enum Event<I> {
     Err(Error),
 }
 
+use std::ffi::{OsStr, OsString};
 #[async_std::main]
 async fn main() {
     let opt = CmdOption::from_args();
@@ -424,15 +447,43 @@ async fn main() {
         TELEPORT_ON_LOGIN = opt.teleport_on_login;
         SERVER_THREAD_NUM = opt.server_thread_num;
         LOG_ALL_DELAY = opt.log_all_delay;
+
+        if let Some(thread_num) = opt.server_thread_num {
+            TOTAL_INTERNAL_DELAY_PER_THREAD.resize_with(thread_num.get(), Default::default);
+            TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD.resize_with(thread_num.get(), Default::default);
+        }
     }
 
-    let mut log_file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&opt.delay_log)
-        .unwrap();
-    writeln!(&mut log_file, "INTERNAL_DELAY, EXTERNAL_DELAY, PACKETS").unwrap();
+    std::sync::atomic::fence(Ordering::SeqCst);
+
+    let mut file_vec = Vec::new();
+    let mut open_option = OpenOptions::new();
+    open_option.write(true).truncate(true).create(true);
+    if let Some(thread_num) = opt.server_thread_num.map(NonZeroUsize::get) {
+        let mut file_path: PathBuf = opt.delay_log.clone();
+        let file_name_base: String = opt
+            .delay_log
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap()
+            .to_owned();
+        for tid in 0..thread_num {
+            file_path.set_file_name::<OsString>(
+                (file_name_base.clone() + &format!("_{}T.log", tid + 1)).into(),
+            );
+            let file = open_option.open(&file_path).unwrap();
+            file_vec.push(file);
+            writeln!(
+                &mut file_vec[tid],
+                "INTERNAL_DELAY, EXTERNAL_DELAY, PACKETS"
+            )
+            .unwrap();
+        }
+    } else {
+        let log_file = open_option.open(&opt.delay_log).unwrap();
+        file_vec.push(log_file);
+        writeln!(&mut file_vec[0], "INTERNAL_DELAY, EXTERNAL_DELAY, PACKETS").unwrap();
+    }
 
     let (read_handle, mut write_handle) = Options::default()
         .with_capacity(unsafe { MAX_TEST } as usize)
@@ -522,17 +573,24 @@ async fn main() {
 
     if unsafe { LOG_ALL_DELAY } {
         task::spawn_blocking(move || {
-            blocking_main(
-                tx,
-                log_file,
-                err_recv,
-                |file, elapsed_time_up_to_1s, tick_rate| {
-                    log_all_delay(file, elapsed_time_up_to_1s, tick_rate, &mut delay_recv)
-                },
-            );
+            blocking_main(tx, err_recv, |elapsed_time_up_to_1s: &Duration| {
+                log_all_delay(&mut file_vec[0], elapsed_time_up_to_1s, &mut delay_recv)
+            });
+        });
+    } else if let Some(thread_num) = unsafe { SERVER_THREAD_NUM } {
+        task::spawn_blocking(move || {
+            blocking_main(tx, err_recv, |elapsed_time: &Duration| {
+                for tid in 0..thread_num.get() {
+                    log_delay_per_thread(tid, &mut file_vec[tid], elapsed_time);
+                }
+            })
         });
     } else {
-        task::spawn_blocking(move || blocking_main(tx, log_file, err_recv, log_delay));
+        task::spawn_blocking(move || {
+            blocking_main(tx, err_recv, |elapsed_time: &Duration| {
+                log_delay(&mut file_vec[0], elapsed_time)
+            })
+        });
     }
 
     {
@@ -648,12 +706,9 @@ async fn main() {
     }
 }
 
-fn log_delay(file: &mut File, elapsed_time_up_to_1s: &mut Duration, tick_rate: &Duration) {
+fn log_delay(file: &mut File, elapsed_time: &Duration) {
     if PLAYER_NUM.load(Ordering::Relaxed) >= unsafe { MAX_TEST } as usize {
-        *elapsed_time_up_to_1s += *tick_rate;
-        let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
-        if elapsed_time >= 1. {
-            *elapsed_time_up_to_1s = Duration::default();
+        if elapsed_time.as_secs() >= 1 {
             writeln!(
                 file,
                 "{}, {}, {}",
@@ -664,42 +719,56 @@ fn log_delay(file: &mut File, elapsed_time_up_to_1s: &mut Duration, tick_rate: &
                 TOTAL_PACKET_COUNT_IN_1S.load(Ordering::Relaxed)
             )
             .unwrap();
-            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
         }
     }
 }
 
-fn log_all_delay(
-    file: &mut File,
-    elapsed_time_up_to_1s: &mut Duration,
-    tick_rate: &Duration,
-    delay_recv: &mut Receiver<isize>,
-) {
+fn log_delay_per_thread(tid: usize, file: &mut File, elapsed_time: &Duration) {
     if PLAYER_NUM.load(Ordering::Relaxed) >= unsafe { MAX_TEST } as usize {
-        *elapsed_time_up_to_1s += *tick_rate;
-        let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
-        if elapsed_time >= 1. {
-            *elapsed_time_up_to_1s = Duration::default();
+        if elapsed_time.as_secs() >= 1 {
+            writeln!(
+                file,
+                "{},,",
+                unsafe { TOTAL_INTERNAL_DELAY_PER_THREAD[tid].load(Ordering::Relaxed) } as f32
+                    / max(1, unsafe {
+                        TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD[tid].load(Ordering::Relaxed)
+                    }) as f32,
+            )
+            .unwrap();
+            unsafe {
+                TOTAL_INTERNAL_DELAY_PER_THREAD[tid].store(0, Ordering::Relaxed);
+                TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD[tid].store(0, Ordering::Relaxed);
+            }
+            TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+fn log_all_delay(file: &mut File, elapsed_time: &Duration, delay_recv: &mut Receiver<isize>) {
+    if PLAYER_NUM.load(Ordering::Relaxed) > 0 {
+        if elapsed_time.as_secs() >= 1 {
             for delay in delay_recv.try_iter() {
                 writeln!(file, "{},,", delay).unwrap();
             }
-            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
-            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
         }
     }
 }
 
 use crossterm::event::KeyEvent;
-fn blocking_main<F: FnMut(&mut File, &mut Duration, &Duration)>(
+fn blocking_main<F: FnMut(&Duration)>(
     tx: Sender<Event<KeyEvent>>,
-    mut log_file: File,
     err_recv: Receiver<Error>,
     mut fn_loggin_delay: F,
 ) {
@@ -714,23 +783,21 @@ fn blocking_main<F: FnMut(&mut File, &mut Duration, &Duration)>(
                     tx.send(Event::Key(key)).expect("Can't send event message");
                 }
             }
-            if last_tick.elapsed() > tick_rate {
-                fn_loggin_delay(
-                    &mut log_file,
-                    &mut elapsed_time_up_to_1s,
-                    &last_tick.elapsed(),
-                );
+            let elapsed_tick = last_tick.elapsed();
+            if elapsed_tick > tick_rate {
+                elapsed_time_up_to_1s += elapsed_tick;
+                fn_loggin_delay(&elapsed_time_up_to_1s);
                 tx.send(Event::Tick).expect("Can't send event message");
                 last_tick = Instant::now();
             }
         } else {
-            log_delay(
-                &mut log_file,
-                &mut elapsed_time_up_to_1s,
-                &last_tick.elapsed(),
-            );
+            elapsed_time_up_to_1s += last_tick.elapsed();
+            fn_loggin_delay(&elapsed_time_up_to_1s);
             tx.send(Event::Tick).expect("Can't send event message");
             last_tick = Instant::now();
+        }
+        if elapsed_time_up_to_1s.as_secs() >= 1 {
+            elapsed_time_up_to_1s -= Duration::from_secs(1);
         }
         for err in err_recv.try_iter() {
             tx.send(Event::Err(err)).expect("Can't send event message");
