@@ -13,11 +13,12 @@ use num::FromPrimitive;
 use rand::prelude::*;
 use std::collections::hash_map::RandomState;
 use std::io::{stdout, Write};
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::string::ToString;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{
-    mpsc::{channel, Sender},
+    mpsc::{channel, Receiver, Sender},
     Arc,
 };
 use std::{
@@ -48,6 +49,8 @@ static mut BOARD_HEIGHT: usize = 0;
 static mut PORT: u16 = 0;
 static mut CALC_EXTERNAL_DELAY: bool = false;
 static mut TELEPORT_ON_LOGIN: bool = false;
+static mut LOG_ALL_DELAY: bool = false;
+static mut SERVER_THREAD_NUM: Option<NonZeroUsize> = None;
 static PLAYER_NUM: AtomicUsize = AtomicUsize::new(0);
 static INTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
 static EXTERNAL_DELAY: AtomicIsize = AtomicIsize::new(0);
@@ -152,11 +155,12 @@ async fn process_login(
     }
 }
 
-async fn assemble_packet(
+fn assemble_packet(
     player: &Player,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
     received_size: usize,
+    delay_send: &Sender<isize>,
 ) -> Result<()> {
     let recv_buf = &mut buf[..(*prev_packet_size + received_size)];
     let mut packet_head_idx = 0;
@@ -248,14 +252,18 @@ async fn read_packet(
     player: &Player,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
-) -> Result<()> {
+) -> Result<usize> {
     let read_size = stream.read(&mut buf[*prev_packet_size..]).await?;
     ensure!(read_size > 0, "Read zero byte");
-
-    assemble_packet(player, buf, prev_packet_size, read_size).await
+    Ok(read_size)
 }
 
-async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Sender<Error>) {
+async fn receiver(
+    stream: Arc<net::TcpStream>,
+    player: Arc<Player>,
+    err_send: Sender<Error>,
+    delay_send: Sender<isize>,
+) {
     let mut stream = BufReader::new(&*stream);
     let mut buf = Vec::with_capacity(RECV_SIZE);
     unsafe {
@@ -263,16 +271,26 @@ async fn receiver(stream: Arc<net::TcpStream>, player: Arc<Player>, err_send: Se
     }
     let mut prev_packet_size = 0usize;
     while player.is_alive.load(Ordering::Relaxed) {
-        if let Err(e) = read_packet(
+        match read_packet(
             &mut stream,
             player.as_ref(),
             &mut buf,
             &mut prev_packet_size,
         )
         .await
-        {
-            err_send.send(e).expect("Can't send error message");
-            return;
+        .and_then(|read_size| {
+            assemble_packet(
+                player.as_ref(),
+                &mut buf,
+                &mut prev_packet_size,
+                read_size,
+                &delay_send,
+            )
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                err_send.send(e).expect("Can't send error message");
+            }
         }
     }
 }
@@ -380,6 +398,12 @@ struct CmdOption {
 
     #[structopt(long, default_value = "delay.log")]
     delay_log: PathBuf,
+
+    #[structopt(long)]
+    server_thread_num: Option<NonZeroUsize>,
+
+    #[structopt(long)]
+    log_all_delay: bool,
 }
 
 enum Event<I> {
@@ -398,6 +422,8 @@ async fn main() {
         PORT = opt.port;
         CALC_EXTERNAL_DELAY = opt.use_external_delay;
         TELEPORT_ON_LOGIN = opt.teleport_on_login;
+        SERVER_THREAD_NUM = opt.server_thread_num;
+        LOG_ALL_DELAY = opt.log_all_delay;
     }
 
     let mut log_file = OpenOptions::new()
@@ -413,6 +439,7 @@ async fn main() {
         .construct();
 
     let (err_send, err_recv) = channel();
+    let (delay_send, mut delay_recv) = channel();
 
     let server = async move {
         let mut handle = None;
@@ -460,6 +487,7 @@ async fn main() {
                         .await
                         .map_err(|e| err_send.send(e))
                     {
+                        let delay_send = delay_send.clone();
                         let err_send = err_send.clone();
                         handle = Some(task::spawn(async move {
                             let client = Arc::new(client);
@@ -467,6 +495,7 @@ async fn main() {
                                 client.clone(),
                                 player.clone(),
                                 err_send.clone(),
+                                delay_send,
                             ));
                             let send = task::spawn(sender(client, player, err_send, move_cycle));
                             recv.await;
@@ -489,37 +518,22 @@ async fn main() {
     };
     task::spawn(server);
 
-    let tick_rate = Duration::from_millis(16);
-
     let (tx, rx) = channel();
 
-    task::spawn_blocking(move || {
-        let mut last_tick = Instant::now();
-        let mut elapsed_time_up_to_1s = Duration::default();
-        loop {
-            if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
-                if event::poll(d_time).expect("Can't poll event") {
-                    if let CEvent::Key(key) = event::read().expect("Can't read event") {
-                        tx.send(Event::Key(key)).expect("Can't send event message");
-                    }
-                }
-                if last_tick.elapsed() > tick_rate {
-                    log_delay(&mut log_file, &mut elapsed_time_up_to_1s, &last_tick.elapsed());
-                    tx.send(Event::Tick).expect("Can't send event message");
-                    last_tick = Instant::now();
-                }
-            } else {
-                log_delay(&mut log_file, &mut elapsed_time_up_to_1s, &last_tick.elapsed());
-                tx.send(Event::Tick).expect("Can't send event message");
-                last_tick = Instant::now();
-            }
-            for err in err_recv.try_iter() {
-                tx.send(Event::Err(err)).expect("Can't send event message");
-            }
-
-            std::thread::yield_now();
-        }
-    });
+    if unsafe { LOG_ALL_DELAY } {
+        task::spawn_blocking(move || {
+            blocking_main(
+                tx,
+                log_file,
+                err_recv,
+                |file, elapsed_time_up_to_1s, tick_rate| {
+                    log_all_delay(file, elapsed_time_up_to_1s, tick_rate, &mut delay_recv)
+                },
+            );
+        });
+    } else {
+        task::spawn_blocking(move || blocking_main(tx, log_file, err_recv, log_delay));
+    }
 
     {
         let read_handle = read_handle.clone();
@@ -656,5 +670,72 @@ fn log_delay(file: &mut File, elapsed_time_up_to_1s: &mut Duration, tick_rate: &
             TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
             TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
         }
+    }
+}
+
+fn log_all_delay(
+    file: &mut File,
+    elapsed_time_up_to_1s: &mut Duration,
+    tick_rate: &Duration,
+    delay_recv: &mut Receiver<isize>,
+) {
+    if PLAYER_NUM.load(Ordering::Relaxed) >= unsafe { MAX_TEST } as usize {
+        *elapsed_time_up_to_1s += *tick_rate;
+        let elapsed_time = elapsed_time_up_to_1s.as_secs_f32();
+        if elapsed_time >= 1. {
+            *elapsed_time_up_to_1s = Duration::default();
+            for delay in delay_recv.try_iter() {
+                writeln!(file, "{},,", delay).unwrap();
+            }
+            TOTAL_EXTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_COUNT_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_EXTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_INTERNAL_DELAY_IN_1S.store(0, Ordering::Relaxed);
+            TOTAL_PACKET_COUNT_IN_1S.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+use crossterm::event::KeyEvent;
+fn blocking_main<F: FnMut(&mut File, &mut Duration, &Duration)>(
+    tx: Sender<Event<KeyEvent>>,
+    mut log_file: File,
+    err_recv: Receiver<Error>,
+    mut fn_loggin_delay: F,
+) {
+    let tick_rate = Duration::from_millis(16);
+    let mut last_tick = Instant::now();
+    let mut elapsed_time_up_to_1s = Duration::default();
+
+    loop {
+        if let Some(d_time) = tick_rate.checked_sub(last_tick.elapsed()) {
+            if event::poll(d_time).expect("Can't poll event") {
+                if let CEvent::Key(key) = event::read().expect("Can't read event") {
+                    tx.send(Event::Key(key)).expect("Can't send event message");
+                }
+            }
+            if last_tick.elapsed() > tick_rate {
+                fn_loggin_delay(
+                    &mut log_file,
+                    &mut elapsed_time_up_to_1s,
+                    &last_tick.elapsed(),
+                );
+                tx.send(Event::Tick).expect("Can't send event message");
+                last_tick = Instant::now();
+            }
+        } else {
+            log_delay(
+                &mut log_file,
+                &mut elapsed_time_up_to_1s,
+                &last_tick.elapsed(),
+            );
+            tx.send(Event::Tick).expect("Can't send event message");
+            last_tick = Instant::now();
+        }
+        for err in err_recv.try_iter() {
+            tx.send(Event::Err(err)).expect("Can't send event message");
+        }
+
+        std::thread::yield_now();
     }
 }
