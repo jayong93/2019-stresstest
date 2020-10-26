@@ -1,8 +1,4 @@
 use anyhow::{anyhow, bail, ensure, Context, Error, Result};
-use async_std::{
-    io::{prelude::*, BufReader},
-    net, task,
-};
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyModifiers},
     execute,
@@ -28,6 +24,7 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use structopt::StructOpt;
+use tokio::{io::BufReader, net, prelude::*, time};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -38,6 +35,7 @@ use tui::{
     },
     Terminal,
 };
+use lazy_static::lazy_static;
 
 mod packet;
 
@@ -61,6 +59,10 @@ static TOTAL_EXTERNAL_DELAY_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static TOTAL_PACKET_COUNT_IN_1S: AtomicIsize = AtomicIsize::new(0);
 static mut TOTAL_INTERNAL_DELAY_PER_THREAD: Vec<AtomicIsize> = Vec::new();
 static mut TOTAL_INTERNAL_DELAY_COUNT_PER_THREAD: Vec<AtomicIsize> = Vec::new();
+
+lazy_static! {
+    static ref RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+}
 
 #[derive(Debug)]
 struct Player {
@@ -276,7 +278,7 @@ fn process_packet(packet: &[u8], player: &Player, delay_send: &Sender<isize>) ->
 }
 
 async fn read_packet(
-    stream: &mut BufReader<&net::TcpStream>,
+    stream: &mut BufReader<net::tcp::OwnedReadHalf>,
     buf: &mut [u8],
     prev_packet_size: &mut usize,
 ) -> Result<usize> {
@@ -286,12 +288,12 @@ async fn read_packet(
 }
 
 async fn receiver(
-    stream: Arc<net::TcpStream>,
+    stream: net::tcp::OwnedReadHalf,
     player: Arc<Player>,
     err_send: Sender<Error>,
     delay_send: Sender<isize>,
 ) {
-    let mut stream = BufReader::new(&*stream);
+    let mut stream = BufReader::new(stream);
     let mut buf = Vec::with_capacity(RECV_SIZE);
     unsafe {
         buf.set_len(RECV_SIZE);
@@ -318,13 +320,11 @@ async fn receiver(
 }
 
 async fn sender(
-    stream: Arc<net::TcpStream>,
+    mut stream: net::tcp::OwnedWriteHalf,
     player: Arc<Player>,
     err_send: Sender<Error>,
     sleep_time: Duration,
 ) {
-    let mut stream = stream.as_ref();
-
     if unsafe { TELEPORT_ON_LOGIN } {
         let tele_packet = packet::CSTeleport::new();
         let p_bytes = unsafe {
@@ -368,7 +368,7 @@ async fn sender(
             err_send.send(e).expect("Can't send error message");
             return;
         }
-        task::sleep(sleep_time).await;
+        time::sleep(sleep_time).await;
     }
 }
 
@@ -435,8 +435,7 @@ enum Event<I> {
 }
 
 use std::ffi::{OsStr, OsString};
-#[async_std::main]
-async fn main() {
+fn main() -> Result<()> {
     let opt = CmdOption::from_args();
     unsafe {
         MAX_TEST = opt.max_player as u64;
@@ -492,7 +491,11 @@ async fn main() {
     let (err_send, err_recv) = channel();
     let (delay_send, mut delay_recv) = channel();
 
-    let server = async move {
+    let server = move || {
+        let curr_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let mut handle = None;
         let mut ip_addr =
             std::net::SocketAddrV4::new(FromStr::from_str(opt.ip_addr.as_str()).unwrap(), unsafe {
@@ -513,7 +516,7 @@ async fn main() {
 
             last_login_time = Instant::now();
 
-            match net::TcpStream::connect(ip_addr).await {
+            match curr_runtime.block_on(net::TcpStream::connect(ip_addr)) {
                 Ok(mut client) => {
                     client.set_nodelay(true).ok();
 
@@ -524,9 +527,8 @@ async fn main() {
                             std::mem::size_of::<packet::CSLogin>(),
                         )
                     };
-                    if let None = client
-                        .write_all(p_bytes)
-                        .await
+                    if let None = curr_runtime
+                        .block_on(client.write_all(p_bytes))
                         .context("Can't send login packet")
                         .map_err(|e| err_send.send(e))
                         .ok()
@@ -534,23 +536,24 @@ async fn main() {
                         continue;
                     }
 
-                    if let Ok(player) = process_login(&mut client, &mut write_handle)
-                        .await
+                    if let Ok(player) = curr_runtime
+                        .block_on(process_login(&mut client, &mut write_handle))
                         .map_err(|e| err_send.send(e))
                     {
                         let delay_send = delay_send.clone();
                         let err_send = err_send.clone();
-                        handle = Some(task::spawn(async move {
-                            let client = Arc::new(client);
-                            let recv = task::spawn(receiver(
-                                client.clone(),
+                        let (read_half, write_half) = client.into_split();
+                        handle = Some(RUNTIME.spawn(async move {
+                            let recv = RUNTIME.spawn(receiver(
+                                read_half,
                                 player.clone(),
                                 err_send.clone(),
                                 delay_send,
                             ));
-                            let send = task::spawn(sender(client, player, err_send, move_cycle));
-                            recv.await;
-                            send.await;
+                            let send =
+                                RUNTIME.spawn(sender(write_half, player, err_send, move_cycle));
+                            recv.await.ok();
+                            send.await.ok();
                         }));
                         PLAYER_NUM.fetch_add(1, Ordering::Relaxed);
                     } else {
@@ -565,20 +568,20 @@ async fn main() {
             }
         }
 
-        handle.unwrap().await;
+        curr_runtime.block_on(handle.unwrap()).ok();
     };
-    task::spawn(server);
+    RUNTIME.spawn_blocking(server);
 
     let (tx, rx) = channel();
 
     if unsafe { LOG_ALL_DELAY } {
-        task::spawn_blocking(move || {
+        RUNTIME.spawn_blocking(move || {
             blocking_main(tx, err_recv, |elapsed_time_up_to_1s: &Duration| {
                 log_all_delay(&mut file_vec[0], elapsed_time_up_to_1s, &mut delay_recv)
             });
         });
     } else if let Some(thread_num) = unsafe { SERVER_THREAD_NUM } {
-        task::spawn_blocking(move || {
+        RUNTIME.spawn_blocking(move || {
             blocking_main(tx, err_recv, |elapsed_time: &Duration| {
                 for tid in 0..thread_num.get() {
                     log_delay_per_thread(tid, &mut file_vec[tid], elapsed_time);
@@ -586,16 +589,17 @@ async fn main() {
             })
         });
     } else {
-        task::spawn_blocking(move || {
+        RUNTIME.spawn_blocking(move || {
             blocking_main(tx, err_recv, |elapsed_time: &Duration| {
                 log_delay(&mut file_vec[0], elapsed_time)
             })
         });
     }
 
+    let ui_main_fut;
     {
         let read_handle = read_handle.clone();
-        task::spawn_blocking(move || {
+        ui_main_fut = RUNTIME.spawn_blocking(move || {
             enable_raw_mode().expect("Can't use raw mode");
             let mut stdout = stdout();
             execute!(stdout, EnterAlternateScreen).expect("Can't enter to alternate screen");
@@ -697,13 +701,15 @@ async fn main() {
                     _ => {}
                 }
             }
-        })
-        .await
+        });
     }
+    let result = RUNTIME.block_on(ui_main_fut);
 
     for (id, _) in read_handle.read().iter() {
         disconnect_client(*id, &read_handle);
     }
+
+    result.map_err(|e| anyhow!(e))
 }
 
 fn log_delay(file: &mut File, elapsed_time: &Duration) {
