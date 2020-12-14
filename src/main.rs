@@ -504,9 +504,14 @@ fn main() -> Result<()> {
         ip_addr.set_port(unsafe { PORT });
 
         let mut last_login_time = Instant::now();
-        let delay_multiplier = 1;
+        let mut delay_multiplier = 1;
+        let mut is_increasing = true;
         let accept_delay = opt.accept_delay as u128;
         let move_cycle = Duration::from_millis(opt.move_cycle);
+        let mut client_to_disconnect = 0;	
+        let mut max_player_num = unsafe { MAX_TEST };
+        let delay_threshold = opt.delay_threshold as usize;	
+        let delay_threshold2 = (delay_threshold as f64 * 1.5) as usize;
         while PLAYER_NUM.load(Ordering::Relaxed) < unsafe { MAX_TEST } as usize {
             // 접속 가능 여부 판단
             let elapsed_time = last_login_time.elapsed().as_millis();
@@ -514,6 +519,38 @@ fn main() -> Result<()> {
                 continue;
             }
 
+            if delay_threshold > 0 {	
+                let internal_delay = INTERNAL_DELAY.load(Ordering::Relaxed);	
+                let cur_player_num = PLAYER_NUM.load(Ordering::Relaxed) as u64;	
+                if delay_threshold2 < internal_delay as _ {	
+                    if is_increasing {	
+                        max_player_num = cur_player_num;	
+                        is_increasing = false;	
+                    }	
+                    if cur_player_num < 100 {	
+                        continue;	
+                    }	
+                    if elapsed_time < accept_delay * 2 {	
+                        continue;	
+                    }	
+
+                    last_login_time = Instant::now();	
+                    disconnect_client(client_to_disconnect, &mut write_handle);	
+                    client_to_disconnect += 1;	
+                    continue;	
+                } else if delay_threshold < internal_delay as _ {	
+                    delay_multiplier = opt.accept_delay_multiplier as u128;	
+                    continue;	
+                }	
+
+                if max_player_num != unsafe { MAX_TEST }	
+                    && max_player_num - (max_player_num / 20) < cur_player_num	
+                {	
+                    continue;	
+                }	
+
+                is_increasing = true;	
+            }
             last_login_time = Instant::now();
 
             match curr_runtime.block_on(net::TcpStream::connect(ip_addr)) {
